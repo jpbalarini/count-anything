@@ -1,0 +1,15 @@
+[project]
+name = "sales-videos"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "anthropic>=1.9.0",
+    "numpy>=2.5.3",
+    "python-dotenv>=1.2.3",
+    "rfdetr>=1.11.0",
+    "supervision>=0.30.5",
+    "trackers>=2.6.0",
+    "ultralytics>=8.4.162",
+]
