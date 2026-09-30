@@ -158,6 +158,15 @@ def resolve_class(token: str, coco: dict[int, str]) -> int:
     )
 
 
+def is_hidden_label(text: str | None) -> bool:
+    """True when --in-text/--out-text asks to hide that label.
+
+    `None` (flag not given) means "use the default label", so only an
+    explicit empty string or 'none' hides it.
+    """
+    return text is not None and text.strip().lower() in ("", "none")
+
+
 def split_tokens(values: list[str]) -> list[str]:
     """Allow both `--classes car truck` and `--classes car,truck`."""
     out: list[str] = []
@@ -487,11 +496,19 @@ def parse_args() -> argparse.Namespace:
     )
     line.add_argument(
         "--in-text",
-        help="Label shown for 'in' crossings (default: 'in').",
+        help=(
+            "Label shown for 'in' crossings (default: 'in'). Pass "
+            "'none' (or '') to hide the 'in' label on the video; "
+            "crossings are still counted."
+        ),
     )
     line.add_argument(
         "--out-text",
-        help="Label shown for 'out' crossings (default: 'out').",
+        help=(
+            "Label shown for 'out' crossings (default: 'out'). Pass "
+            "'none' (or '') to hide the 'out' label on the video; "
+            "crossings are still counted."
+        ),
     )
     line.add_argument(
         "--swap-direction",
@@ -825,8 +842,14 @@ def main() -> None:
             text_scale=0.8,
             custom_in_text=args.in_text,
             custom_out_text=args.out_text,
-            display_in_count=args.direction in ("both", "in"),
-            display_out_count=args.direction in ("both", "out"),
+            display_in_count=(
+                args.direction in ("both", "in")
+                and not is_hidden_label(args.in_text)
+            ),
+            display_out_count=(
+                args.direction in ("both", "out")
+                and not is_hidden_label(args.out_text)
+            ),
         )
 
     # -- Detector ---------------------------------------------------
@@ -1117,6 +1140,8 @@ def main() -> None:
         source_path=str(source_path),
         target_path=str(target_path),
         callback=callback,
+        show_progress=True,
+        progress_message="Rendering video",
     )
 
     if use_cloud:

@@ -2,16 +2,30 @@
 
 ## Line crossing
 
-python process_video.py highway/yHuR-GMbRNKnZLBvDBtHs_minimax-h3_topaz_upscale.mp4 \
+Horizontal in/out line
+```
+python process_video.py videos/highway/yHuR-GMbRNKnZLBvDBtHs_minimax-h3_topaz_upscale.mp4 \
   --line 0 700 1892 700 --in-text "EASTBOUND →" --out-text "← WESTBOUND" \
   --classes car truck \
   --hud-title "TRAFFIC MONITORING" \
   --hud-rows "VEHICLES=all" "CARS=car" "TRUCKS=truck" --min-size 35 25
+```
 
+Vertical line
+```
+python process_video.py videos/conveyor/upscaled/ttC_MBiNQpWETFACh7yoA_minimax-h3_upscaled.mp4 \
+  --line 940 0 940 1080 --in-text "COUNT" --out-text "" \
+  --classes apple \
+  --model large \
+  --hud-title "CONVEYOR BELT MONITORING" \
+  --hud-rows "APPLES=apple" \
+  --min-size 0 0 \
+  --threshold 0.2
+```
 
 ## Total count instead of line crossing
 
-python process_video.py shipping_container/7RswKdWQhN167Z_MV8IgP_minimax-h3_upscale.mp4 \
+python process_video.py videos/shipping_container/7RswKdWQhN167Z_MV8IgP_minimax-h3_upscale.mp4 \
   --count-mode total \
   --classes car truck \
   --hud-title "TRAFFIC MONITORING" \
@@ -23,7 +37,7 @@ Counts every distinct tracked object seen in the video. No line is drawn.
 ## Cloud model instead of RF-DETR
 
     # put ANTHROPIC_API_KEY=... in .env (loaded automatically)
-    python process_video.py shipping_container/7RswKdWQhN167Z_MV8IgP_minimax-h3_upscale.mp4 \
+    python process_video.py videos/shipping_container/7RswKdWQhN167Z_MV8IgP_minimax-h3_upscale.mp4 \
       --detector cloud \
       --cloud-model claude-sonnet-5-5 --sample-rate 4 \
       --count-mode total \
