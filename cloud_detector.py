@@ -1,6 +1,6 @@
 """Cloud vision model detector (Anthropic) for process_video.py.
 
-Replaces the local RF-DETR model: instead of running on every frame,
+Alternative to the RF-DETR detector: instead of running on every frame,
 `CloudDetector.detect` is called on sampled frames only and returns
 `sv.Detections` in original-frame pixel coordinates.
 """
