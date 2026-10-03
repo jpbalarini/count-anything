@@ -368,12 +368,14 @@ def main() -> None:
                 class_names={c: coco[c] for c in class_ids},
                 mode=args.locate_mode,
                 threads=args.locate_threads,
+                lib_path=args.locate_lib,
             )
         except RuntimeError as exc:
             sys.exit(f"error: {exc}")
         print(
             f"locate-anything detector: {args.locate_model} "
-            f"({args.locate_mode}), {effective_rate:g} samples/s (one "
+            f"({args.locate_mode}, {locate_detector.backend}), "
+            f"{effective_rate:g} samples/s (one "
             f"call every {sample_step:g} frames, ~{expected_calls} "
             "calls, one at a time)"
         )

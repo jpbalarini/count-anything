@@ -101,9 +101,9 @@ Works with both `--count-mode crossing` and `--count-mode total`.
 ## locate-anything.cpp instead of RF-DETR
 
 Uses [locate-anything.cpp](https://github.com/mudler/locate-anything.cpp)
-(`locate-anything-cli` must be in PATH). Like the cloud detector it runs on
-sampled frames only (`--sample-rate`, default 1/s) and `--classes` is
-free-form text. Each class becomes part of the prompt
+(`locate-anything-cli` in PATH, or the shared library, see below). Like the
+cloud detector it runs on sampled frames only (`--sample-rate`, default 1/s)
+and `--classes` is free-form text. Each class becomes part of the prompt
 (`Locate all the instances that matches the following description: apple.`).
 
     python process_video.py videos/conveyor/upscaled/ttC_MBiNQpWETFACh7yoA_minimax-h3_upscaled.mp4 \
@@ -115,8 +115,40 @@ free-form text. Each class becomes part of the prompt
 
 `--locate-model` can also come from the `LOCATE_ANYTHING_MODEL` env var (or
 `.env`). Extra options: `--locate-mode hybrid|slow|fast`, `--locate-threads N`.
-The CLI gives no confidence scores (all detections get 1.0, so `--threshold`
-has no effect) and reloads the model on every call.
+There are no confidence scores (all detections get 1.0, so `--threshold`
+has no effect).
+
+### Load the model once (`--locate-lib`)
+
+`locate-anything-cli` is a one-shot tool: it loads the model on every call and
+has no batch mode. The engine also ships as a C library, which this project can
+drive through a small worker process (`locate_anything_worker.py`) that loads the model
+once and then serves every sampled frame. Build it once (add
+`-DLA_GGML_CUDA=ON` / `-DLA_GGML_VULKAN=ON` instead of Metal on other
+hardware):
+
+    cmake -S path/to/locate-anything.cpp -B path/to/locate-anything.cpp/build-shared \
+      -DLA_SHARED=ON -DLA_GGML_METAL=ON -DLA_BUILD_CLI=OFF
+    cmake --build path/to/locate-anything.cpp/build-shared -j
+
+and point to it with `--locate-lib .../build-shared/liblocate_anything.dylib`
+(or `LOCATE_ANYTHING_LIB` in `.env`). Without it the CLI is used, as before.
+
+- If the GPU backend crashes on a frame (it has been seen to fault with Metal
+  page faults), only the worker dies: that sample is skipped, like a failed CLI
+  call, and a new worker is started for the next one.
+- Don't expect a big speedup from this alone. Measured on an M5 Max (q8_0
+  model, 1260x720 frame, interleaved runs) a call takes ~5.3 s with the CLI
+  and ~5.1 s with the library: the reload costs about 0.2 s while the model
+  file is in the OS cache, because inference dominates. It helps more when the
+  model file is not cached (slow disk, memory pressure). Results match: same
+  box counts on every sampled frame; coordinates differed by at most 0.72 px
+  from the separately built CLI that was installed here.
+- What does make it faster is the input size, see `--infer-resolution` below.
+  Same frame, resident engine: 720p 4.95 s, 540p 3.33 s (1 of 43 boxes lost),
+  360p 2.80 s. `--locate-mode fast` was no quicker than `hybrid` (4.94 s) and
+  `slow` was slower (6.62 s). Check small objects on your own footage before
+  going low.
 
 ## Faster inference on big videos
 

@@ -50,9 +50,12 @@ Detectors
                           frames only, see --sample-rate. Needs the
                           ANTHROPIC_API_KEY environment variable.
   --detector locate-anything
-                          locate-anything.cpp (`locate-anything-cli` in
-                          PATH) on sampled frames only. Needs
-                          --locate-model path/to/model.gguf.
+                          locate-anything.cpp on sampled frames only.
+                          Needs --locate-model path/to/model.gguf, and
+                          --locate-lib path/to/liblocate_anything.dylib
+                          to load the model once (else
+                          `locate-anything-cli` in PATH is used, which
+                          reloads it on every frame).
 
 Speed / iteration
 -----------------
@@ -245,7 +248,7 @@ def parse_args() -> argparse.Namespace:
         help=(
             "`rfdetr`: RF-DETR, on every frame unless --sample-rate is "
             "given. `cloud`: a cloud vision model on sampled frames. "
-            "`locate-anything`: locate-anything (locate-anything-cli) on "
+            "`locate-anything`: locate-anything.cpp on "
             f"sampled frames (default: {DEFAULT_DETECTOR}). Ignored with "
             "--load-detections."
         ),
@@ -257,6 +260,18 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Path to the locate-anything .gguf model, required with "
             "--detector locate-anything (default: $LOCATE_ANYTHING_MODEL)."
+        ),
+    )
+    cloud.add_argument(
+        "--locate-lib",
+        default=os.environ.get("LOCATE_ANYTHING_LIB"),
+        metavar="LIB",
+        help=(
+            "Path to liblocate_anything (.dylib / .so, built with "
+            "-DLA_SHARED=ON). The model is then loaded once instead of "
+            "on every frame (a small gain when the model file is in the "
+            "OS cache, see the README). Without it `locate-anything-cli` "
+            "is used (default: $LOCATE_ANYTHING_LIB)."
         ),
     )
     cloud.add_argument(
