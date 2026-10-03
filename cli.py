@@ -28,6 +28,12 @@ DETECTORS = ["rfdetr", "cloud", "locate-anything"]
 DEFAULT_DETECTOR = "rfdetr"
 # Detectors that take free-form class names (anything else uses COCO).
 OPEN_VOCAB_DETECTORS = {"cloud", "locate-anything"}
+# Detections (frames, or samples when detection is sampled) in a row an
+# object may be missed in and still be drawn (--hold-frames), for the
+# detectors that sometimes miss objects on a frame. The others (rfdetr)
+# don't hold unless asked.
+DEFAULT_HOLD_FRAMES = 2
+
 # Detector calls per second of video. Detectors not listed here run on
 # every frame unless --sample-rate is given.
 DEFAULT_SAMPLE_RATES = {
@@ -192,6 +198,24 @@ def parse_args() -> argparse.Namespace:
         ),
     )
 
+    det.add_argument(
+        "--hold-frames",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Keep drawing a tracked object when the detector misses it "
+            "in up to N detections (frames, or samples when detection "
+            "is sampled) in a row, so frames on which it returns only "
+            "some of the objects don't make boxes blink. With "
+            "--interpolate the box moves from where it was last found "
+            "to where it is found again; without, it stays where it "
+            "was last found. Only affects what is drawn, not the "
+            f"counts. 0 = off (default: {DEFAULT_HOLD_FRAMES} for cloud "
+            "/ locate-anything, 0 for rfdetr)."
+        ),
+    )
+
     mode = p.add_argument_group("counting mode")
     mode.add_argument(
         "--count-mode",
@@ -317,13 +341,15 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "With sampled detection, move the boxes smoothly between "
-            "samples instead of holding each one until the next sample "
-            "(--no-interpolate to hold). Tracked objects present in two "
-            "consecutive samples are interpolated linearly. Needs the "
-            "next sample, so the HUD counts follow the previous one. "
-            "Works best at about 5 samples/s or more. No effect when "
-            "detecting on every frame (default: on)."
+            "Move each tracked object linearly between its detections: "
+            "smoothly between samples instead of holding each box until "
+            "the next sample, and across detections that missed it (see "
+            "--hold-frames). --no-interpolate holds the box instead. "
+            "Needs the detections after the current one, so the HUD "
+            "counts follow the previous sample. With sampled detection "
+            "it works best at about 5 samples/s or more. Without "
+            "--hold-frames it changes nothing when detecting on every "
+            "frame (default: on)."
         ),
     )
     cloud.add_argument(
@@ -504,6 +530,8 @@ def parse_args() -> argparse.Namespace:
         p.error("--min-size / --max-size must be >= 0")
     if args.sample_rate is not None and args.sample_rate <= 0:
         p.error("--sample-rate must be > 0")
+    if args.hold_frames is not None and args.hold_frames < 0:
+        p.error("--hold-frames must be >= 0")
     if args.cloud_concurrency < 1:
         p.error("--cloud-concurrency must be >= 1")
     if args.cloud_max_side < 64:

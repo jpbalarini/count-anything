@@ -7,6 +7,7 @@ Run `python process_video.py --help` for the options and examples
 from __future__ import annotations
 
 import bisect
+import math
 import os
 import sys
 from collections import defaultdict
@@ -20,6 +21,7 @@ from tqdm import tqdm
 
 from cli import (
     DEFAULT_DETECTOR,
+    DEFAULT_HOLD_FRAMES,
     DEFAULT_SAMPLE_RATES,
     DETECTORS,
     OPEN_VOCAB_DETECTORS,
@@ -29,8 +31,8 @@ from cloud_detector import CloudDetector
 from detections_io import load_detections, save_detections, to_detections
 from frames import (
     CountedLine,
+    TrackTimeline,
     inference_size,
-    interpolate_detections,
     sampling_due,
 )
 from hud import Hud
@@ -210,8 +212,8 @@ def main() -> None:
             max(1.0, video_info.fps / sample_rate) if sample_rate else 1.0
         )
     sampled = sample_step > 1.0
-    interpolate = args.interpolate and sampled
-    if interpolate:
+    interpolate = args.interpolate
+    if interpolate and sampled:
         print(
             "Interpolating boxes between samples "
             "(disable with --no-interpolate)"
@@ -463,7 +465,20 @@ def main() -> None:
     # the sampled rate, not the video FPS.
     from trackers import ByteTrackTracker
 
+    # Some detectors return only part of the objects on a frame. A track
+    # they miss in up to --hold-frames detections in a row stays on
+    # screen: held where it was, or interpolated towards where it is
+    # found again (--interpolate).
+    hold_frames = args.hold_frames
+    if hold_frames is None:
+        hold_frames = DEFAULT_HOLD_FRAMES if open_vocab else 0
+
     byte_tracker = ByteTrackTracker(
+        # The tracker has to keep the id of a track across those missed
+        # detections (its default is 1 s; the unit is 30 FPS frames).
+        lost_track_buffer=max(
+            30, math.ceil(hold_frames * 30 / effective_rate)
+        ),
         frame_rate=effective_rate,
         minimum_consecutive_frames=args.min_track_frames,
         track_activation_threshold=args.track_threshold,
@@ -520,6 +535,35 @@ def main() -> None:
     min_w, min_h = args.min_size
     max_w, max_h = args.max_size
     hyst = args.size_hysteresis
+
+    # {track id: [its box as a one-row Detections, detections missed in a row]}
+    last_shown: dict[int, list] = {}
+
+    def with_held(shown: sv.Detections) -> sv.Detections:
+        """`shown` plus the recently seen tracks that are missing from it.
+
+        Not used with --interpolate, where the boxes of a missed track
+        are interpolated between its detections instead.
+        """
+        if hold_frames <= 0 or interpolate:
+            return shown
+
+        present: set[int] = set()
+        if shown.tracker_id is not None:
+            for row, tracker_id in enumerate(shown.tracker_id):
+                present.add(int(tracker_id))
+                last_shown[int(tracker_id)] = [shown[row], 0]
+
+        held = []
+        for tracker_id, entry in list(last_shown.items()):
+            if tracker_id in present:
+                continue
+            entry[1] += 1
+            if entry[1] > hold_frames:
+                del last_shown[tracker_id]
+            else:
+                held.append(entry[0])
+        return sv.Detections.merge([shown, *held]) if held else shown
 
     # Track ids currently considered "big enough". Once an id is in
     # here it only leaves when it falls below the relaxed
@@ -608,7 +652,7 @@ def main() -> None:
                 for class_id in detections.class_id[crossed]:
                     counts[int(class_id)] += 1
 
-        return display_detections
+        return with_held(display_detections)
 
     # Detections currently on screen. With sampled detection these are
     # held (unchanged) until the next sample arrives, unless
@@ -618,10 +662,10 @@ def main() -> None:
 
     # -- Interpolation (--interpolate) ------------------------------
     # Drawing a frame between two samples needs the tracked boxes of
-    # the next one, so tracking, size filter and counting run over
-    # every sample up front. Each sample keeps a snapshot of the counts
-    # (HUD and line) as they were right after it, which is what is shown
-    # until the next sample.
+    # the samples after it, so tracking, size filter and counting run
+    # over every sample up front. Each sample keeps a snapshot of the
+    # counts (HUD and line) as they were right after it, which is what is
+    # shown until the next sample.
     # samples: (frame index, boxes to draw, HUD counts, line in, line out)
     samples: list[tuple[int, sv.Detections, dict, int, int]] = []
     if interpolate:
@@ -640,20 +684,18 @@ def main() -> None:
                 )
             )
     sample_indices = [s[0] for s in samples]
+    timeline = TrackTimeline(
+        sample_indices, [s[1] for s in samples], hold_frames
+    )
 
     def state_at(index: int):
         """(boxes, HUD counts, line) to show on frame `index`."""
         pos = bisect.bisect_right(sample_indices, index) - 1
         if pos < 0:  # before the first successful sample
             empty_line = CountedLine(line_zone, 0, 0) if line_zone else None
-            return sv.Detections.empty(), {}, empty_line
-        _, boxes, hud_counts, line_in, line_out = samples[pos]
-        if pos + 1 < len(samples):
-            next_index, next_boxes = samples[pos + 1][:2]
-            t = (index - sample_indices[pos]) / (
-                next_index - sample_indices[pos]
-            )
-            boxes = interpolate_detections(boxes, next_boxes, t)
+            return timeline.at(index), {}, empty_line
+        _, _, hud_counts, line_in, line_out = samples[pos]
+        boxes = timeline.at(index)
         line = (
             CountedLine(line_zone, line_in, line_out)
             if line_zone

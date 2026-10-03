@@ -46,15 +46,19 @@ counting and drawing. RF-DETR runs on every frame by default; add
 
 When detection is sampled (fewer detections than video frames), a box that is
 simply held until the next sample would jump. By default the boxes move
-linearly between samples instead. Use `--no-interpolate` to hold them:
+linearly between samples instead. Use `--no-interpolate` to hold them. It also
+fills in the frames an object was missed on, with every detector and when
+detecting on every frame (see `--hold-frames` below):
 
     python process_video.py input.mp4 --sample-rate 10
     python process_video.py input.mp4 --sample-rate 10 --no-interpolate
 
 - Tracking, counting and the size filter run over all samples first, then the
-  video is rendered by interpolating between consecutive samples. Objects are
-  matched by track id; an object that is gone at the next sample stays where it
-  was, and a new one appears when its sample is reached.
+  video is rendered by interpolating each tracked object (matched by track id)
+  between its detections. An object a sample missed is interpolated between the
+  samples before and after it, see `--hold-frames` below. An object that is not
+  found again stays where it was until the next sample, and a new one appears
+  when its sample is reached.
 - The HUD and in/out counts show the values as of the previous sample, so they
   stay in sync with the boxes.
 - Traces (`--trace-length`) are drawn too, since every frame now has a position.
@@ -62,8 +66,40 @@ linearly between samples instead. Use `--no-interpolate` to hold them:
   `locate-anything` defaults are 2 and 1 per second) fast or non-linear motion
   and wrong track matches show up as boxes sliding across the screen; consider
   `--no-interpolate` there.
-- No effect when detecting on every frame. Works with every detector and with
-  `--load-detections`.
+- When detecting on every frame there is nothing to smooth, so it only matters
+  for `--hold-frames`. Works with every detector and with `--load-detections`.
+
+### Boxes blinking off and on (`--hold-frames`)
+
+Generative detectors (`locate-anything`, `cloud`) have no per-box confidence
+and sometimes return only some of the objects for a frame.
+
+`--hold-frames N` keeps drawing an object the detector misses in up to N
+detections in a row (frames, or samples when detection is sampled; default 2
+for `cloud` and `locate-anything`, off for `rfdetr`; `0` disables). It only
+affects what is drawn, not the counts.
+
+- With `--interpolate` (the default) the box of a missed object moves from
+  where it was last found to where it is found again: an object found at N,
+  missed at N+1 and N+2 and found at N+3 is drawn on the line between its
+  positions at N and N+3. If it is missed in more than N samples in a row it is
+  taken to be gone.
+- With `--no-interpolate` the box stays where it was last found.
+- The tracker keeps a track's id across those N missed detections, which also
+  means that at low sample rates it remembers lost objects longer (at 1 sample/s
+  with N=2, 2 s instead of 1 s) and may re-use the id of an object that is found
+  again instead of counting it twice. The shipping container video counts 112
+  with `--hold-frames 0` and 109 with the default.
+- N counts detections, not time: at 60 samples/s 2 is 1/30 s, at 1 sample/s it
+  is 2 s. Raise it if boxes still blink when the detector misses an object for
+  longer.
+
+Counts are a separate matter: at one detection per frame (`--sample-rate`
+equal to the FPS) a container the model finds only now and then is given new
+track ids, which inflates `--count-mode total`. The shipping container video
+counts 154 at 60 samples/s against 112 (109 with the default `--hold-frames`) at
+1 sample/s. A few samples per second
+with interpolation gives much steadier boxes and counts than every frame.
 
 ## Cloud model instead of RF-DETR
 
