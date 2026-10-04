@@ -218,3 +218,43 @@ files need no API key or model. Use the same source video. Detections are
 saved before tracking, so the file holds every class above the threshold used
 when it was made (lower `--threshold` when saving if you might want to raise it
 later).
+
+## Fix the detections by hand (annotation UI)
+
+A web UI (FastAPI) to review and correct a detections file before
+re-rendering: move, resize, relabel, add and delete boxes, frame by frame.
+
+    python annotate_server.py                      # choose the files in the UI
+    python annotate_server.py dets.json            # video found from the file
+    python annotate_server.py input.mp4 dets.json
+    python process_video.py input.mp4 --load-detections dets.json ...
+
+The UI opens on http://127.0.0.1:8000. Its file picker (folder button, or
+`⌘O`) lists the detections files under `--root` (default: the current
+directory), newest first, each matched to the video named in its
+`meta.source`. Pick one, or type the paths (relative to `--root` or
+absolute) when the video isn't found. Opening other files in one tab makes
+the other tabs stop saving instead of writing into the wrong file.
+
+- Every change is saved to `dets.json` right away (the first change keeps the
+  untouched file as `dets.orig.json`). Re-render with `--load-detections`.
+- Only the frames the detector ran on (the ones in the file) are shown.
+- Box tool (`B`): drag anywhere to draw, even over other boxes; click to
+  select, drag the selected box to move it, drag a handle to resize. Clicking
+  the selected box again cycles through the boxes under the cursor.
+- `R` (or "Fill in from previous frame") adds the previous frame's boxes that
+  have no overlapping box of the same class here: the objects the detector
+  missed on this frame. `O` shows the previous frame's boxes as dashed ghosts.
+- The timeline under the image shows the box count per frame: dips are frames
+  where the detector likely missed objects. Click or drag it to jump. The
+  frames panel can be filtered to edited / not edited / empty / failed frames.
+- `⌘C` / `⌘V` copy boxes across frames, `1`–`9` set the class, `⌘Z` undoes
+  (across frames). Press `?` for every shortcut.
+- With an `rfdetr` file the class editor suggests COCO names (the labels must
+  be COCO classes to load back), and a slider hides / deletes low-confidence
+  boxes.
+- Classes added in the UI and the edited frames are kept in the file's `meta`
+  (`annotator_classes`, `annotator_edited_frames`); `process_video.py`
+  ignores them.
+
+Options: `--root`, `--port`, `--host`, `--no-browser`.

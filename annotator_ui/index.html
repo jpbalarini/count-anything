@@ -1,0 +1,310 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Detections Annotator</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%232563eb' stroke-width='2.4' stroke-linecap='round'%3E%3Cpath d='M5 3v18M19 3v18M3 5h18M3 19h18'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/annotator.css">
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <symbol id="i-hand" viewBox="0 0 24 24"><path d="M18 11V6a2 2 0 0 0-4 0"/><path d="M14 10V4a2 2 0 0 0-4 0v2"/><path d="M10 10.5V6a2 2 0 0 0-4 0v8"/><path d="M18 8a2 2 0 1 1 4 0v6a8 8 0 0 1-8 8h-2c-2.8 0-4.5-.86-6-2.34l-3.6-3.6a2 2 0 0 1 2.83-2.82L7 15"/></symbol>
+    <symbol id="i-box" viewBox="0 0 24 24"><path d="M6 3v18M18 3v18M3 6h18M3 18h18"/></symbol>
+    <symbol id="i-repeat" viewBox="0 0 24 24"><path d="m17 2 4 4-4 4"/><path d="M3 11v-1a4 4 0 0 1 4-4h14"/><path d="m7 22-4-4 4-4"/><path d="M21 13v1a4 4 0 0 1-4 4H3"/></symbol>
+    <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8" y="8" width="13" height="13" rx="2"/><path d="M4 16a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2"/></symbol>
+    <symbol id="i-undo" viewBox="0 0 24 24"><path d="M3 7v6h6"/><path d="M21 17a9 9 0 0 0-15-6.7L3 13"/></symbol>
+    <symbol id="i-redo" viewBox="0 0 24 24"><path d="M21 7v6h-6"/><path d="M3 17a9 9 0 0 1 15-6.7l3 2.7"/></symbol>
+    <symbol id="i-null" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M5.6 18.4 18.4 5.6"/></symbol>
+    <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></symbol>
+    <symbol id="i-eye-off" viewBox="0 0 24 24"><path d="M9.9 9.9a3 3 0 1 0 4.2 4.2"/><path d="M10.7 5.1A10 10 0 0 1 12 5c7 0 10 7 10 7a13 13 0 0 1-1.7 2.7"/><path d="M6.6 6.6A13.5 13.5 0 0 0 2 12s3 7 10 7a9.7 9.7 0 0 0 5.4-1.6"/><path d="m2 2 20 20"/></symbol>
+    <symbol id="i-onion" viewBox="0 0 24 24"><path d="m12 2 10 5-10 5L2 7z"/><path d="m2 17 10 5 10-5"/><path d="m2 12 10 5 10-5"/></symbol>
+    <symbol id="i-tag" viewBox="0 0 24 24"><path d="M12 2H2v10l9.3 9.3a1 1 0 0 0 1.4 0l8.6-8.6a1 1 0 0 0 0-1.4z"/><circle cx="7" cy="7" r="1.2"/></symbol>
+    <symbol id="i-more" viewBox="0 0 24 24"><circle cx="12" cy="5" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="12" cy="19" r="1"/></symbol>
+    <symbol id="i-panel" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M15 3v18"/></symbol>
+    <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M6.3 17.7l-1.4 1.4M19.1 4.9l-1.4 1.4"/></symbol>
+    <symbol id="i-keyboard" viewBox="0 0 24 24"><rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M8 14h8"/></symbol>
+    <symbol id="i-lock" viewBox="0 0 24 24"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></symbol>
+    <symbol id="i-unlock" viewBox="0 0 24 24"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 7.9-1"/></symbol>
+    <symbol id="i-minus" viewBox="0 0 24 24"><path d="M5 12h14"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+    <symbol id="i-trash" viewBox="0 0 24 24"><path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6"/></symbol>
+    <symbol id="i-left" viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"/></symbol>
+    <symbol id="i-right" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></symbol>
+    <symbol id="i-play" viewBox="0 0 24 24"><path d="M7 4v16l13-8z" fill="currentColor"/></symbol>
+    <symbol id="i-pause" viewBox="0 0 24 24"><path d="M7 4h3v16H7zM14 4h3v16h-3z" fill="currentColor"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></symbol>
+    <symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></symbol>
+    <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M21 12a9 9 0 0 1-15.5 6.2L3 16"/><path d="M3 12a9 9 0 0 1 15.5-6.2L21 8"/><path d="M21 3v5h-5M3 21v-5h5"/></symbol>
+    <symbol id="i-film" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M7 3v18M17 3v18M3 8h4M3 16h4M17 8h4M17 16h4"/></symbol>
+    <symbol id="i-sparkle" viewBox="0 0 24 24"><path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z"/><path d="M19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8z"/></symbol>
+  </defs>
+</svg>
+
+<div id="app">
+  <!-- ============ Left sidebar ============ -->
+  <aside id="left">
+    <header class="file-head">
+      <div class="file-text">
+        <div class="file-name" id="fileName">Loading…</div>
+        <div class="file-sub" id="fileSub"></div>
+      </div>
+      <button class="icon-btn" id="openBtn" title="Open other files (⌘O)"><svg class="ic"><use href="#i-folder"/></svg></button>
+    </header>
+
+    <section class="panel ann-panel">
+      <div class="panel-title">
+        <span>Annotations</span>
+        <span class="count-pill" id="annCount">0</span>
+      </div>
+      <div class="group-line">Detector: <b id="detectorName">–</b></div>
+
+      <div class="tabs" role="tablist">
+        <button class="tab active" data-tab="classes" role="tab">Classes</button>
+        <button class="tab" data-tab="layers" role="tab">Layers</button>
+      </div>
+
+      <div class="tab-body" id="classesTab">
+        <ul class="class-list" id="classList"></ul>
+        <div class="unused">
+          <div class="unused-title">Unused Classes</div>
+          <ul class="unused-list" id="unusedList"></ul>
+        </div>
+      </div>
+      <div class="tab-body" id="layersTab" hidden>
+        <ul class="layer-list" id="layerList"></ul>
+      </div>
+
+      <div class="conf" id="confPanel" hidden>
+        <div class="conf-row">
+          <label for="confSlider">Hide below confidence</label>
+          <span class="mono" id="confValue">0.00</span>
+        </div>
+        <input type="range" id="confSlider" min="0" max="1" step="0.01" value="0">
+        <button class="btn btn-ghost btn-sm" id="confDelete" disabled>Delete hidden boxes on this frame</button>
+      </div>
+
+      <button class="btn btn-outline" id="fillPrevBtn" title="Add the previous frame's boxes that are missing here (R)">
+        <svg class="ic"><use href="#i-sparkle"/></svg> Fill in from previous frame
+      </button>
+    </section>
+
+    <section class="panel frame-panel">
+      <div class="panel-subtitle">Frame</div>
+      <dl class="facts">
+        <dt>Index</dt><dd class="mono" id="factIndex">–</dd>
+        <dt>Time</dt><dd class="mono" id="factTime">–</dd>
+        <dt>Sample</dt><dd class="mono" id="factSample">–</dd>
+        <dt>Status</dt><dd id="factStatus">–</dd>
+      </dl>
+    </section>
+
+    <form class="add-class" id="addClassForm" autocomplete="off">
+      <input id="addClassInput" placeholder="Add class…" list="suggestionList">
+      <button class="btn btn-primary" type="submit"><svg class="ic"><use href="#i-plus"/></svg> Add</button>
+      <datalist id="suggestionList"></datalist>
+    </form>
+  </aside>
+
+  <!-- ============ Canvas ============ -->
+  <main id="center">
+    <div id="stage">
+      <canvas id="canvas"></canvas>
+
+      <div class="banner" id="banner" hidden></div>
+
+      <div class="empty" id="emptyState" hidden>
+        <svg class="ic"><use href="#i-folder"/></svg>
+        <h2>No files open</h2>
+        <p>Choose a detections file written by <code>--save-detections</code> and its video.</p>
+        <button class="btn btn-primary" id="emptyOpen"><svg class="ic"><use href="#i-folder"/></svg> Open detections</button>
+      </div>
+
+      <div class="float topbar">
+        <span class="status" id="saveStatus" data-state="saved"><span class="dot"></span><span class="txt">Saved</span></span>
+        <button class="icon-btn" id="eyeBtn" title="Show / hide annotations (E)"><svg class="ic"><use href="#i-eye"/></svg></button>
+        <button class="icon-btn" id="onionBtn" title="Ghost of the previous frame's boxes (O)"><svg class="ic"><use href="#i-onion"/></svg></button>
+        <button class="icon-btn" id="labelsBtn" title="Show all labels (L)"><svg class="ic"><use href="#i-tag"/></svg></button>
+        <div class="menu-wrap">
+          <button class="icon-btn" id="menuBtn" title="More"><svg class="ic"><use href="#i-more"/></svg></button>
+          <div class="menu" id="menu" hidden>
+            <button data-action="fill">Fill in from previous frame <kbd>R</kbd></button>
+            <button data-action="replace">Replace with previous frame's boxes</button>
+            <button data-action="copyall">Copy all boxes <kbd>⌘C</kbd></button>
+            <hr>
+            <button data-action="clear" class="danger">Delete all boxes on this frame</button>
+          </div>
+        </div>
+        <span class="vsep"></span>
+        <button class="icon-btn" id="panelBtn" title="Toggle frames panel"><svg class="ic"><use href="#i-panel"/></svg></button>
+      </div>
+
+      <div class="float toolbar" id="toolbar">
+        <button class="tool" data-tool="pan" title="Pan (H) — or hold Space"><svg class="ic"><use href="#i-hand"/></svg></button>
+        <button class="tool" data-tool="box" title="Bounding box (B)"><svg class="ic"><use href="#i-box"/></svg></button>
+        <span class="hsep"></span>
+        <button class="tool" id="toolFill" title="Fill in from previous frame (R)"><svg class="ic"><use href="#i-repeat"/></svg></button>
+        <button class="tool" id="toolDup" title="Duplicate selected box (⌘D)"><svg class="ic"><use href="#i-copy"/></svg></button>
+        <span class="hsep"></span>
+        <button class="tool" id="toolUndo" title="Undo (⌘Z)"><svg class="ic"><use href="#i-undo"/></svg></button>
+        <button class="tool" id="toolRedo" title="Redo (⌘⇧Z)"><svg class="ic"><use href="#i-redo"/></svg></button>
+        <span class="hsep"></span>
+        <button class="tool" id="toolClear" title="Delete all boxes on this frame"><svg class="ic"><use href="#i-null"/></svg></button>
+      </div>
+
+      <div class="float-row bottombar">
+        <div class="float zoom">
+          <button class="icon-btn" id="zoomOut" title="Zoom out (−)"><svg class="ic"><use href="#i-minus"/></svg></button>
+          <span class="zoom-val mono" id="zoomVal">100%</span>
+          <button class="icon-btn" id="lockBtn" title="Keep zoom when changing frames"><svg class="ic"><use href="#i-lock"/></svg></button>
+          <button class="icon-btn" id="zoomIn" title="Zoom in (+)"><svg class="ic"><use href="#i-plus"/></svg></button>
+          <button class="link-btn" id="zoomReset" title="Fit to screen (F)">RESET</button>
+        </div>
+        <div class="popover-wrap">
+          <button class="float square" id="lightBtn" title="Brightness / contrast"><svg class="ic"><use href="#i-sun"/></svg></button>
+          <div class="popover" id="lightPop" hidden>
+            <label>Brightness <span class="mono" id="brightVal">100%</span></label>
+            <input type="range" id="bright" min="0.3" max="2.5" step="0.05" value="1">
+            <label>Contrast <span class="mono" id="contrastVal">100%</span></label>
+            <input type="range" id="contrast" min="0.3" max="2.5" step="0.05" value="1">
+            <button class="link-btn" id="lightReset">RESET</button>
+          </div>
+        </div>
+        <button class="float square primary" id="keysBtn" title="Keyboard shortcuts (?)"><svg class="ic"><use href="#i-keyboard"/></svg></button>
+      </div>
+
+      <!-- Annotation editor -->
+      <div class="editor" id="editor" hidden>
+        <div class="editor-head">
+          <span>Annotation Editor</span>
+          <button class="icon-btn sm" id="editorClose" title="Close (Esc)"><svg class="ic"><use href="#i-x"/></svg></button>
+        </div>
+        <div class="editor-body">
+          <input id="editorInput" autocomplete="off" spellcheck="false" placeholder="Class name">
+          <div class="editor-actions">
+            <button class="btn btn-danger" id="editorDelete">Delete</button>
+            <button class="btn btn-outline" id="editorSave">Save (Enter)</button>
+          </div>
+        </div>
+        <ul class="editor-list" id="editorList"></ul>
+      </div>
+
+      <div class="toast" id="toast" hidden></div>
+    </div>
+
+    <div id="timelineWrap">
+      <button class="icon-btn" id="playBtn" title="Play through frames (P)"><svg class="ic"><use href="#i-play"/></svg></button>
+      <div class="timeline">
+        <canvas id="timeline"></canvas>
+        <div class="tl-tip" id="tlTip" hidden></div>
+      </div>
+      <div class="tl-legend">
+        <span><i class="sw sw-base"></i>boxes / frame</span>
+        <span><i class="sw sw-edit"></i>edited</span>
+        <span><i class="sw sw-fail"></i>failed</span>
+      </div>
+    </div>
+  </main>
+
+  <!-- ============ Right sidebar ============ -->
+  <aside id="right">
+    <div class="right-head">Frames</div>
+    <div class="pager">
+      <button class="icon-btn" id="prevBtn" title="Previous frame (A / ←)"><svg class="ic"><use href="#i-left"/></svg></button>
+      <span class="pager-mid"><input id="pageInput" class="mono" inputmode="numeric"> <span class="mono">/ <span id="pageTotal">0</span></span></span>
+      <button class="icon-btn" id="nextBtn" title="Next frame (D / →)"><svg class="ic"><use href="#i-right"/></svg></button>
+    </div>
+    <select id="filterSelect" class="filter">
+      <option value="all">All frames</option>
+      <option value="edited">Edited</option>
+      <option value="unedited">Not edited</option>
+      <option value="empty">No boxes</option>
+      <option value="failed">Detection failed</option>
+    </select>
+    <div class="thumbs" id="thumbs"></div>
+  </aside>
+</div>
+
+<!-- Shortcuts -->
+<div class="modal-back" id="keysModal" hidden>
+  <div class="modal">
+    <div class="modal-head">
+      <span>Keyboard shortcuts</span>
+      <button class="icon-btn sm" id="keysClose"><svg class="ic"><use href="#i-x"/></svg></button>
+    </div>
+    <div class="keys-grid">
+      <div><h4>Frames</h4>
+        <p><kbd>A</kbd> <kbd>D</kbd> / <kbd>←</kbd> <kbd>→</kbd><span>Previous / next frame</span></p>
+        <p><kbd>⇧</kbd>+ above<span>Jump 10 frames</span></p>
+        <p><kbd>P</kbd><span>Play / pause</span></p>
+        <p><kbd>R</kbd><span>Fill in missing boxes from previous frame</span></p>
+        <p><kbd>O</kbd><span>Ghost of previous frame's boxes</span></p>
+      </div>
+      <div><h4>Tools &amp; view</h4>
+        <p><kbd>B</kbd><span>Box tool — drag anywhere to draw</span></p>
+        <p><kbd>H</kbd> / hold <kbd>Space</kbd><span>Pan</span></p>
+        <p>Scroll<span>Zoom at cursor</span></p>
+        <p><kbd>F</kbd> <kbd>+</kbd> <kbd>−</kbd><span>Fit / zoom in / out</span></p>
+        <p><kbd>E</kbd> <kbd>L</kbd><span>Hide boxes / show all labels</span></p>
+      </div>
+      <div><h4>Selected box</h4>
+        <p>Click<span>Select (click again to cycle overlapping)</span></p>
+        <p><kbd>Tab</kbd><span>Select next box</span></p>
+        <p><kbd>Enter</kbd> / double-click<span>Change class</span></p>
+        <p><kbd>1</kbd>…<kbd>9</kbd><span>Set class (or active class)</span></p>
+        <p><kbd>←</kbd><kbd>↑</kbd><kbd>→</kbd><kbd>↓</kbd><span>Nudge 1 px (⇧ 10 px)</span></p>
+        <p><kbd>⌫</kbd><span>Delete</span></p>
+        <p><kbd>Esc</kbd><span>Deselect</span></p>
+      </div>
+      <div><h4>Edit</h4>
+        <p><kbd>⌘Z</kbd> <kbd>⌘⇧Z</kbd><span>Undo / redo</span></p>
+        <p><kbd>⌘C</kbd> <kbd>⌘V</kbd><span>Copy / paste boxes (works across frames)</span></p>
+        <p><kbd>⌘D</kbd><span>Duplicate</span></p>
+        <p><kbd>⌘S</kbd><span>Save now (changes autosave)</span></p>
+        <p><kbd>⌘O</kbd><span>Open other files</span></p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Open files -->
+<div class="modal-back" id="openModal" hidden>
+  <div class="modal picker" role="dialog" aria-labelledby="openTitle">
+    <div class="modal-head">
+      <span id="openTitle">Open detections</span>
+      <button class="icon-btn sm" id="openClose" title="Close (Esc)"><svg class="ic"><use href="#i-x"/></svg></button>
+    </div>
+    <div class="picker-body">
+      <div class="picker-bar">
+        <input id="openSearch" placeholder="Filter detections files…" autocomplete="off" spellcheck="false">
+        <button class="icon-btn" id="openRefresh" title="Search the folder again"><svg class="ic"><use href="#i-refresh"/></svg></button>
+      </div>
+      <div class="picker-root">Detections files in <span class="mono" id="openRoot"></span>, newest first</div>
+      <ul class="picker-list" id="openList"></ul>
+
+      <div class="picker-or"><span>or choose the files</span></div>
+      <label class="field">
+        <span>Detections JSON</span>
+        <input id="openDets" list="openDetsList" placeholder="path/to/dets.json" autocomplete="off" spellcheck="false">
+      </label>
+      <label class="field">
+        <span>Video</span>
+        <input id="openVideo" list="openVideoList" placeholder="Leave empty to use the video named in the file" autocomplete="off" spellcheck="false">
+      </label>
+      <datalist id="openDetsList"></datalist>
+      <datalist id="openVideoList"></datalist>
+      <div class="picker-error" id="openError" hidden></div>
+    </div>
+    <div class="picker-foot">
+      <span class="picker-hint">Paths are relative to the folder above, or absolute.</span>
+      <button class="btn btn-quiet" id="openCancel">Cancel</button>
+      <button class="btn btn-primary" id="openGo">Open</button>
+    </div>
+  </div>
+</div>
+
+<script src="/static/annotator.js"></script>
+</body>
+</html>
