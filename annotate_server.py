@@ -6,11 +6,11 @@ relabeled, added and deleted. Every change is written back to the same
 file; re-render the video with `--load-detections`.
 
     python annotate_server.py                      # pick the files in the UI
-    python annotate_server.py DETECTIONS.json      # video found from meta.source
+    python annotate_server.py DETECTIONS.json      # video found from videos[0].file_name
     python annotate_server.py VIDEO DETECTIONS.json [--port 8000]
 
 The UI lists the detections files found under --root (default: the
-current directory), each matched to the video named in its meta.source.
+current directory), each matched to the video named in its videos[0].file_name.
 
 Only the frames the detector ran on (the ones in the file) can be
 edited. The first change keeps a copy of the file as it was
@@ -20,9 +20,7 @@ edited. The first change keeps a copy of the file as it was
 from __future__ import annotations
 
 import argparse
-import json
 import os
-import re
 import shutil
 import threading
 import uuid
@@ -39,8 +37,12 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from detections_io import FORMAT_VERSION, load_detections
-from frames import sampling_due
+from detections_io import (
+    DetectionsFile,
+    is_detections_file,
+    load_detections,
+    write_detections,
+)
 from options import normalize_name
 
 UI_DIR = Path(__file__).parent / "annotator_ui"
@@ -54,15 +56,11 @@ FRAME_CACHE_SIZE = 48
 # stepping through samples never depends on the codec seeking exactly.
 MAX_READ_AHEAD = 120
 
-# Extra keys this tool keeps in the file's "meta" (ignored by
-# process_video.py): classes added in the UI that may not be used on any
-# frame yet, and the frames that were changed by hand.
-META_CLASSES = "annotator_classes"
-META_EDITED = "annotator_edited_frames"
-
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"}
 # Not searched for files.
 SKIP_DIRS = {"node_modules", "__pycache__", "venv", "site-packages"}
+# Annotator backups, not listed.
+BACKUP_SUFFIXES = (".orig.json",)
 
 
 def encode_jpeg(frame: np.ndarray, quality: int) -> bytes:
@@ -189,33 +187,73 @@ class ClassesUpdate(BaseModel):
 
 
 class DetectionsStore:
-    """The detections file, held in memory and written on every change."""
+    """The detections file, held in memory and written on every change.
+
+    Classes are the file's categories, which may include classes no box
+    uses yet (added in the UI). Frames changed here are marked edited.
+    """
 
     def __init__(self, path: Path, width: int, height: int):
         self.path = path
-        self.meta, self.frames = load_detections(path)
+        self.data: DetectionsFile = load_detections(path)
+        self.frames = self.data.frames
         self.width = width
         self.height = height
         self._lock = threading.Lock()
+        # rfdetr files use COCO's category ids, so new COCO classes get
+        # theirs.
+        self._coco_ids = (
+            {normalize_name(n): i for i, n in coco_classes().items()}
+            if self.detector == "rfdetr"
+            else {}
+        )
+
+    @property
+    def info(self) -> dict:
+        return self.data.info
+
+    @property
+    def video(self) -> dict:
+        return self.data.video
+
+    @property
+    def detector(self) -> str | None:
+        return self.data.info.get("detector")
 
     @property
     def edited(self) -> list[int]:
-        return sorted(int(i) for i in self.meta.get(META_EDITED, []))
+        return sorted(self.data.edited)
 
     def classes(self) -> list[str]:
-        """Every class name: the ones added in the UI, then the ones on
-        the boxes (most frequent first). Names that only differ in case
-        or `_`/`-` (the same class for process_video.py) appear once."""
+        """Every class name: the categories, then labels used on boxes
+        without one (most frequent first). Names that only differ in
+        case or `_`/`-` (the same class for process_video.py) appear
+        once."""
         counts: dict[str, int] = {}
         for items in self.frames.values():
             for item in items or []:
                 counts[item["label"]] = counts.get(item["label"], 0) + 1
         names: dict[str, str] = {}
-        for name in self.meta.get(META_CLASSES, []):
-            names.setdefault(normalize_name(name), name)
+        for category in self.data.categories:
+            names.setdefault(normalize_name(category["name"]), category["name"])
         for name in sorted(counts, key=lambda n: -counts[n]):
             names.setdefault(normalize_name(name), name)
         return list(names.values())
+
+    def _canonical(self, label: str) -> str:
+        """`label` as spelled by its category, adding the category if
+        it's new (with its COCO id for rfdetr files)."""
+        label = label.strip()
+        key = normalize_name(label)
+        for category in self.data.categories:
+            if normalize_name(category["name"]) == key:
+                return category["name"]
+        taken = {c["id"] for c in self.data.categories}
+        new_id = self._coco_ids.get(key)
+        if new_id is None or new_id in taken:
+            new_id = max(taken | set(self._coco_ids.values()), default=0) + 1
+        self.data.categories.append({"id": new_id, "name": label})
+        return label
 
     def _clean(self, box: Box) -> dict:
         x1, y1, x2, y2 = box.box
@@ -224,7 +262,7 @@ class DetectionsStore:
         x1, x2 = np.clip([x1, x2], 0, self.width)
         y1, y2 = np.clip([y1, y2], 0, self.height)
         return {
-            "label": box.label.strip(),
+            "label": self._canonical(box.label),
             "confidence": round(box.confidence, 4),
             "box": [round(float(v), 2) for v in (x1, y1, x2, y2)],
         }
@@ -235,47 +273,48 @@ class DetectionsStore:
                 raise KeyError(index)
             cleaned = [self._clean(b) for b in boxes]
             self.frames[index] = cleaned
-            edited = set(self.edited)
-            edited.add(index)
-            self.meta[META_EDITED] = sorted(edited)
+            self.data.edited.add(index)
             self._write()
             return cleaned
 
     def set_classes(self, classes: list[str]) -> None:
+        """Make the categories `classes`. Categories still used on a
+        frame are kept (with their ids)."""
         with self._lock:
-            self.meta[META_CLASSES] = [c.strip() for c in classes if c.strip()]
+            wanted = {normalize_name(c) for c in classes if c.strip()}
+            used = {
+                normalize_name(item["label"])
+                for items in self.frames.values()
+                for item in items or []
+            }
+            self.data.categories = [
+                c
+                for c in self.data.categories
+                if normalize_name(c["name"]) in wanted | used
+            ]
+            for name in classes:
+                if name.strip():
+                    self._canonical(name)
             self._write()
 
     def _write(self) -> None:
         backup = self.path.with_name(f"{self.path.stem}.orig{self.path.suffix}")
         if not backup.exists():
             shutil.copy2(self.path, backup)
-        tmp = self.path.with_name(f".{self.path.name}.tmp")
-        tmp.write_text(
-            json.dumps(
-                {
-                    "version": FORMAT_VERSION,
-                    "meta": self.meta,
-                    "frames": {
-                        str(i): self.frames[i] for i in sorted(self.frames)
-                    },
-                },
-                separators=(",", ":"),
-            )
-        )
-        os.replace(tmp, self.path)
+        write_detections(self.path, self.data)
 
 
 @cache
-def coco_class_names() -> tuple[str, ...]:
-    """COCO names, offered as suggestions for rfdetr files (whose labels
-    must be COCO classes to load). Empty if rfdetr isn't importable."""
+def coco_classes() -> dict[int, str]:
+    """COCO id -> name. Offered as suggestions for rfdetr files (whose
+    labels must be COCO classes to load). Empty if rfdetr isn't
+    importable."""
     try:
         from options import load_coco_classes
 
-        return tuple(name for _, name in sorted(load_coco_classes().items()))
+        return dict(sorted(load_coco_classes().items()))
     except Exception:
-        return ()
+        return {}
 
 
 class Session:
@@ -293,18 +332,20 @@ class Session:
         except ValueError:
             self.reader.close()
             raise
-        meta = self.store.meta
+        video = self.store.video
         self.suggestions = (
-            list(coco_class_names()) if meta.get("detector") == "rfdetr" else []
+            list(coco_classes().values())
+            if self.store.detector == "rfdetr"
+            else []
         )
         self.warnings = [
-            f"{key} {meta[key]} (video: {actual})"
+            f"{key} {video[key]} (video: {actual})"
             for key, actual in (
                 ("width", self.reader.width),
                 ("height", self.reader.height),
                 ("total_frames", self.reader.total_frames),
             )
-            if meta.get(key) not in (None, actual)
+            if video.get(key) not in (None, actual)
         ]
         threading.Thread(
             target=self.reader.warm_thumbnails,
@@ -319,26 +360,38 @@ class Session:
 # -- Finding files --------------------------------------------------
 
 
-def peek_meta(path: Path) -> dict | None:
-    """The "meta" of a detections file, or None if it isn't one.
+# path -> ((mtime, size), summary): files are only parsed again when
+# they change.
+_summaries: dict[Path, tuple[tuple[int, int], dict | None]] = {}
 
-    Only the start of the file is read: process_video.py writes "meta"
-    before "frames", so this stays fast on big files."""
+
+def summarize(path: Path) -> dict | None:
+    """What the file picker shows about a detections file, or None if
+    it isn't one."""
     try:
-        with path.open("rb") as f:
-            head = f.read(256 * 1024).decode("utf-8", "ignore")
+        stat = path.stat()
     except OSError:
         return None
-    if '"version"' not in head:
-        return None
-    match = re.search(r'"meta"\s*:\s*', head)
-    if not match:
-        return None
-    try:
-        meta, _ = json.JSONDecoder().raw_decode(head, match.end())
-    except ValueError:
-        return None
-    return meta if isinstance(meta, dict) else None
+    key = (stat.st_mtime_ns, stat.st_size)
+    cached = _summaries.get(path)
+    if cached and cached[0] == key:
+        return cached[1]
+
+    summary: dict | None = None
+    if is_detections_file(path):
+        try:
+            data = load_detections(path)
+        except ValueError:
+            data = None
+        if data is not None:
+            summary = {
+                "detector": data.info.get("detector"),
+                "source": data.video.get("file_name"),
+                "samples": len(data.frames),
+                "edited": len(data.edited),
+            }
+    _summaries[path] = (key, summary)
+    return summary
 
 
 def walk_files(root: Path):
@@ -364,16 +417,14 @@ def best_video(json_path: Path, name: str, videos: list[Path]) -> Path | None:
     return min(candidates, key=closeness)
 
 
-def sample_count(meta: dict) -> int | None:
-    """How many frames the detector ran on (same rule as process_video)."""
-    total, step = meta.get("total_frames"), meta.get("sample_step") or 1
-    if not total:
-        return None
-    count, next_at = 0, 0.0
-    for index in range(total):
-        due, next_at = sampling_due(index, next_at, step)
-        count += due
-    return count
+def video_of(detections: Path, root: Path) -> tuple[str | None, Path | None]:
+    """(video name in the file, that video under `root` or None)."""
+    summary = summarize(detections) or {}
+    source = summary.get("source")
+    if not source:
+        return None, None
+    _, videos = find_files(root)
+    return source, best_video(Path(os.path.abspath(detections)), source, videos)
 
 
 def find_files(root: Path) -> tuple[list[dict], list[Path]]:
@@ -384,23 +435,23 @@ def find_files(root: Path) -> tuple[list[dict], list[Path]]:
         suffix = path.suffix.lower()
         if suffix in VIDEO_EXTENSIONS:
             videos.append(path)
-        elif suffix == ".json" and not path.name.endswith(".orig.json"):
+        elif suffix == ".json" and not path.name.endswith(BACKUP_SUFFIXES):
             jsons.append(path)
 
     found = []
     for path in jsons:
-        meta = peek_meta(path)
-        if meta is None or "detector" not in meta:
+        summary = summarize(path)
+        if summary is None:
             continue
-        source = meta.get("source")
-        video = best_video(path, source, videos) if source else None
+        source = summary.get("source")
         found.append({
             "path": path,
-            "detector": meta.get("detector"),
-            "source": source,
-            "video": video,
-            "samples": sample_count(meta),
-            "edited": len(meta.get(META_EDITED, [])),
+            "detector": None,
+            "source": None,
+            "samples": None,
+            "edited": 0,
+            **summary,
+            "video": best_video(path, source, videos) if source else None,
             "modified": path.stat().st_mtime,
         })
     found.sort(key=lambda f: -f["modified"])
@@ -504,9 +555,10 @@ def create_app(root: Path, initial: tuple[Path, Path] | None = None) -> FastAPI:
             if not video.is_file():
                 raise HTTPException(400, f"no such file: {req.video}")
         else:
-            source = (peek_meta(detections) or {}).get("source")
-            _, videos = find_files(root)
-            video = best_video(detections, source, videos) if source else None
+            try:
+                source, video = video_of(detections, root)
+            except ValueError as exc:
+                raise HTTPException(400, str(exc))
             if video is None:
                 raise HTTPException(
                     400,
@@ -531,7 +583,7 @@ def create_app(root: Path, initial: tuple[Path, Path] | None = None) -> FastAPI:
             "detections": session.detections.name,
             "detections_path": rel(session.detections),
             "warnings": session.warnings,
-            "meta": store.meta,
+            "meta": store.info,
             "width": reader.width,
             "height": reader.height,
             "fps": reader.fps,
@@ -611,7 +663,7 @@ def main() -> None:
         help=(
             "Optional: the detections JSON to edit (in place), and the "
             "source video. Without the video, the one named in the "
-            "file's meta.source is looked up under --root."
+            "file's videos[0].file_name is looked up under --root."
         ),
     )
     p.add_argument(
@@ -648,9 +700,10 @@ def main() -> None:
         if videos:
             video = videos[0]
         else:
-            source = (peek_meta(detections) or {}).get("source")
-            _, found = find_files(root)
-            video = best_video(Path(os.path.abspath(detections)), source, found) if source else None
+            try:
+                source, video = video_of(detections, root)
+            except ValueError as exc:
+                raise SystemExit(f"error: {exc}")
             if video is None:
                 raise SystemExit(
                     f"error: can't find the video {source or '(not recorded)'} "

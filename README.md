@@ -219,6 +219,46 @@ saved before tracking, so the file holds every class above the threshold used
 when it was made (lower `--threshold` when saving if you might want to raise it
 later).
 
+### Detections file format
+
+A COCO-style JSON where the video is a sequence of images: each annotation
+belongs to an image (a frame), each image to the video. The images are
+virtual, nothing is written to disk for them.
+
+```json
+{
+  "info": {"description": "rfdetr detections of apple, orange in input.mp4",
+           "url": "", "version": "1.0", "year": 2026, "contributor": "",
+           "date_created": "2026-10-04T17:34:25-03:00",
+           "format": "coco-video", "format_version": 2,
+           "detector": "rfdetr", "sample_step": 6.0, "infer_resolution": null,
+           "threshold": 0.2, "model": "medium"},
+  "categories": [{"id": 53, "name": "apple"}, {"id": 55, "name": "orange"}],
+  "videos": [{"id": 1, "file_name": "input.mp4", "fps": 24.0,
+              "width": 1344, "height": 768, "total_frames": 243}],
+  "images": [{"id": 1, "video_id": 1, "frame_id": 0,
+              "file_name": "input/000000.jpg", "width": 1344, "height": 768}],
+  "annotations": [{"id": 1, "image_id": 1, "category_id": 53,
+                   "bbox": [75.41, 265.22, 91.66, 133.9], "area": 12273.27,
+                   "iscrowd": 0, "segmentation": [], "score": 0.6341}]
+}
+```
+
+- `bbox` is COCO's `[x, y, width, height]` in video pixels; `score` is the
+  detector confidence (1.0 for detectors without one, and for boxes drawn by
+  hand).
+- `info` holds the detection settings; the video's properties are only in
+  `videos`. Set `description` / `contributor` / `url` with the flags of the
+  same name when saving (the description is generated otherwise).
+- One image per frame the detector ran on. An image without annotations is a
+  frame where nothing was found; `"detection_failed": true` marks a frame whose
+  detection call failed, `"edited": true` one changed in the annotator.
+- Category ids are COCO's for `rfdetr` files (1–90, with gaps) and 1..N for
+  free-form classes. Loading matches categories by name.
+- No `track_id`: detections are saved before tracking, which runs when
+  rendering.
+- The file opens in standard COCO tools (e.g. `pycocotools`).
+
 ## Fix the detections by hand (annotation UI)
 
 A web UI (FastAPI) to review and correct a detections file before
@@ -232,7 +272,7 @@ re-rendering: move, resize, relabel, add and delete boxes, frame by frame.
 The UI opens on http://127.0.0.1:8000. Its file picker (folder button, or
 `⌘O`) lists the detections files under `--root` (default: the current
 directory), newest first, each matched to the video named in its
-`meta.source`. Pick one, or type the paths (relative to `--root` or
+`videos[0].file_name`. Pick one, or type the paths (relative to `--root` or
 absolute) when the video isn't found. Opening other files in one tab makes
 the other tabs stop saving instead of writing into the wrong file.
 
@@ -253,8 +293,8 @@ the other tabs stop saving instead of writing into the wrong file.
 - With an `rfdetr` file the class editor suggests COCO names (the labels must
   be COCO classes to load back), and a slider hides / deletes low-confidence
   boxes.
-- Classes added in the UI and the edited frames are kept in the file's `meta`
-  (`annotator_classes`, `annotator_edited_frames`); `process_video.py`
-  ignores them.
+- Classes added in the UI become categories (new COCO classes get their COCO
+  id in `rfdetr` files), and changed frames get `"edited": true` on their
+  image.
 
 Options: `--root`, `--port`, `--host`, `--no-browser`.

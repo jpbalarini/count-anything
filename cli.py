@@ -253,6 +253,24 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     speed.add_argument(
+        "--description",
+        default="",
+        help=(
+            "info.description of the --save-detections file (default: "
+            "'<detector> detections of <classes> in <video>')."
+        ),
+    )
+    speed.add_argument(
+        "--contributor",
+        default="",
+        help="info.contributor of the --save-detections file.",
+    )
+    speed.add_argument(
+        "--url",
+        default="",
+        help="info.url of the --save-detections file.",
+    )
+    speed.add_argument(
         "--load-detections",
         metavar="JSON",
         help=(

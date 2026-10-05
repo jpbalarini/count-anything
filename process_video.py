@@ -28,7 +28,13 @@ from cli import (
     parse_args,
 )
 from cloud_detector import CloudDetector
-from detections_io import load_detections, save_detections, to_detections
+from detections_io import (
+    DetectionsFile,
+    load_detections,
+    new_info,
+    save_detections,
+    to_detections,
+)
 from frames import (
     CountedLine,
     TrackTimeline,
@@ -68,16 +74,13 @@ def main() -> None:
     # -- Saved detections (--load-detections) -----------------------
     # The file records which detector produced it, which decides the
     # class namespace (COCO vs free-form) and the sampling.
-    loaded_meta: dict | None = None
-    loaded_frames: dict[int, list | None] = {}
+    loaded: DetectionsFile | None = None
     if args.load_detections:
         try:
-            loaded_meta, loaded_frames = load_detections(
-                Path(args.load_detections)
-            )
+            loaded = load_detections(Path(args.load_detections))
         except ValueError as exc:
             sys.exit(f"error: {exc}")
-        detector = loaded_meta.get("detector")
+        detector = loaded.info.get("detector")
         if detector not in DETECTORS:
             sys.exit(
                 f"error: {args.load_detections}: unknown detector "
@@ -202,8 +205,8 @@ def main() -> None:
     # The detector runs every `sample_step` frames: every frame (1.0) by
     # default for RF-DETR, a few times per second for the others.
     # A loaded file dictates the step it was recorded with.
-    if loaded_meta is not None:
-        sample_step = float(loaded_meta.get("sample_step", 1.0))
+    if loaded is not None:
+        sample_step = float(loaded.info.get("sample_step", 1.0))
         if args.sample_rate is not None:
             print("note: --sample-rate ignored with --load-detections")
     else:
@@ -231,7 +234,7 @@ def main() -> None:
         video_info.width, video_info.height, args.infer_resolution
     )
     resized = (infer_w, infer_h) != (video_info.width, video_info.height)
-    if resized and loaded_meta is None:
+    if resized and loaded is None:
         print(
             f"Inference resolution: {infer_w}x{infer_h} "
             f"(video is {video_info.width}x{video_info.height})"
@@ -274,7 +277,7 @@ def main() -> None:
             if due:
                 yield i, to_infer(frame)
 
-    if loaded_meta is not None:
+    if loaded is not None:
         name_to_id = {normalize_name(n): c for c, n in coco.items()}
         detections_by_frame = {
             index: (
@@ -284,16 +287,16 @@ def main() -> None:
                     items, name_to_id, normalize_name, args.threshold
                 )
             )
-            for index, items in loaded_frames.items()
+            for index, items in loaded.frames.items()
         }
         mismatch = [
-            f"{key} {loaded_meta[key]} (video: {actual})"
+            f"{key} {loaded.video[key]} (video: {actual})"
             for key, actual in (
                 ("width", video_info.width),
                 ("height", video_info.height),
                 ("total_frames", video_info.total_frames),
             )
-            if loaded_meta.get(key) not in (None, actual)
+            if loaded.video.get(key) not in (None, actual)
         ]
         if mismatch:
             print(
@@ -437,22 +440,41 @@ def main() -> None:
         if not args.save_detections:
             return
         save_path = Path(args.save_detections)
-        save_detections(
-            save_path,
+        class_names = ", ".join(coco[c] for c in class_ids)
+        info = new_info(
             {
                 "detector": detector,
-                "source": source_path.name,
-                "width": video_info.width,
-                "height": video_info.height,
-                "fps": video_info.fps,
-                "total_frames": video_info.total_frames,
                 "sample_step": sample_step,
                 "infer_resolution": args.infer_resolution,
                 "threshold": args.threshold,
                 **detector_meta,
             },
+            description=args.description
+            or f"{detector} detections of {class_names} in {source_path.name}",
+            contributor=args.contributor,
+            url=args.url,
+        )
+        video = {
+            "file_name": source_path.name,
+            "fps": video_info.fps,
+            "width": video_info.width,
+            "height": video_info.height,
+            "total_frames": video_info.total_frames,
+        }
+        save_detections(
+            save_path,
+            info,
+            video,
             detections_by_frame,
             label_of=lambda class_id: coco.get(class_id, str(class_id)),
+            # RF-DETR class ids are COCO's category ids; free-form
+            # classes are numbered from 0.
+            category_id_of=(
+                (lambda class_id: class_id + 1)
+                if open_vocab
+                else (lambda class_id: class_id)
+            ),
+            class_ids=class_ids,
         )
         print(f"Saved detections to: {save_path}")
 
