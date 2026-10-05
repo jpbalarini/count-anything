@@ -15,3 +15,6 @@ wheels/
 *.DS_Store
 
 *.mp4
+
+# Fine-tuned models (train_rfdetr.py)
+models/

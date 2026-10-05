@@ -39,6 +39,10 @@
     <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></symbol>
     <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M21 12a9 9 0 0 1-15.5 6.2L3 16"/><path d="M3 12a9 9 0 0 1 15.5-6.2L21 8"/><path d="M21 3v5h-5M3 21v-5h5"/></symbol>
     <symbol id="i-film" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M7 3v18M17 3v18M3 8h4M3 16h4M17 8h4M17 16h4"/></symbol>
+    <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" rx="2"/><path d="M9 9h6v6H9zM9 2v3M15 2v3M9 19v3M15 19v3M2 9h3M2 15h3M19 9h3M19 15h3"/></symbol>
+    <symbol id="i-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="1.5" fill="currentColor"/></symbol>
+    <symbol id="i-upload" viewBox="0 0 24 24"><path d="M12 15V3M7 8l5-5 5 5M4 15v4a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-4"/></symbol>
+    <symbol id="i-terminal" viewBox="0 0 24 24"><path d="m4 17 6-5-6-5M12 19h8"/></symbol>
     <symbol id="i-sparkle" viewBox="0 0 24 24"><path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z"/><path d="M19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8z"/></symbol>
   </defs>
 </svg>
@@ -123,10 +127,15 @@
       </div>
 
       <div class="float topbar">
+        <button class="job-pill" id="jobPill" title="Training / detection jobs" hidden>
+          <span class="job-pill-dot"></span><span class="job-pill-txt"></span>
+          <span class="job-pill-bar"><i></i></span>
+        </button>
         <span class="status" id="saveStatus" data-state="saved"><span class="dot"></span><span class="txt">Saved</span></span>
         <button class="icon-btn" id="eyeBtn" title="Show / hide annotations (E)"><svg class="ic"><use href="#i-eye"/></svg></button>
         <button class="icon-btn" id="onionBtn" title="Ghost of the previous frame's boxes (O)"><svg class="ic"><use href="#i-onion"/></svg></button>
         <button class="icon-btn" id="labelsBtn" title="Show all labels (L)"><svg class="ic"><use href="#i-tag"/></svg></button>
+        <button class="icon-btn" id="trainBtn" title="Train an RF-DETR on these detections (T)"><svg class="ic"><use href="#i-cpu"/></svg></button>
         <div class="menu-wrap">
           <button class="icon-btn" id="menuBtn" title="More"><svg class="ic"><use href="#i-more"/></svg></button>
           <div class="menu" id="menu" hidden>
@@ -264,6 +273,7 @@
         <p><kbd>⌘D</kbd><span>Duplicate</span></p>
         <p><kbd>⌘S</kbd><span>Save now (changes autosave)</span></p>
         <p><kbd>⌘O</kbd><span>Open other files</span></p>
+        <p><kbd>T</kbd><span>Train a model / jobs</span></p>
       </div>
     </div>
   </div>
@@ -301,6 +311,95 @@
       <span class="picker-hint">Paths are relative to the folder above, or absolute.</span>
       <button class="btn btn-quiet" id="openCancel">Cancel</button>
       <button class="btn btn-primary" id="openGo">Open</button>
+    </div>
+  </div>
+</div>
+
+<!-- Train a model / jobs -->
+<div class="modal-back" id="trainModal" hidden>
+  <div class="modal train" role="dialog" aria-labelledby="trainTitle">
+    <div class="modal-head">
+      <span id="trainTitle">Fine-tune RF-DETR</span>
+      <div class="tabs train-tabs" role="tablist">
+        <button class="tab active" data-ttab="new" role="tab">New model</button>
+        <button class="tab" data-ttab="jobs" role="tab">Models &amp; jobs <span class="count-pill" id="jobsCount" hidden></span></button>
+      </div>
+      <button class="icon-btn sm" id="trainClose" title="Close (Esc)"><svg class="ic"><use href="#i-x"/></svg></button>
+    </div>
+
+    <!-- New model -->
+    <div class="train-body" id="ttabNew">
+      <p class="train-intro">Use the boxes of these detections files (from any detector, fixed by hand or not) to teach a small, fast RF-DETR, then run it on every frame of this or similar videos.</p>
+
+      <section class="tsec">
+        <h4>Detections to learn from</h4>
+        <ul class="train-files" id="trainFiles"></ul>
+      </section>
+
+      <section class="tsec">
+        <h4>Classes</h4>
+        <div class="train-classes" id="trainClasses"></div>
+      </section>
+
+      <section class="tsec tgrid">
+        <h4>Frames</h4>
+        <label class="tfield"><span>Use</span>
+          <select id="trainFrames">
+            <option value="all">All frames</option>
+            <option value="edited">Only frames fixed by hand</option>
+          </select>
+        </label>
+        <label class="tfield"><span>Every</span>
+          <span class="tinline"><input type="number" id="trainEvery" min="1" value="1"> frame(s)</span>
+        </label>
+        <label class="tfield" id="trainMinScoreRow"><span>Min. confidence</span>
+          <input type="number" id="trainMinScore" min="0" max="1" step="0.05">
+        </label>
+        <div class="tnote" id="trainFrameNote"></div>
+      </section>
+
+      <section class="tsec tgrid">
+        <h4>Model</h4>
+        <label class="tfield"><span>Size</span>
+          <select id="trainModel"></select>
+        </label>
+        <label class="tfield"><span>Epochs</span>
+          <input type="number" id="trainEpochs" min="1">
+        </label>
+        <label class="tfield"><span>Batch size</span>
+          <input type="number" id="trainBatch" min="1">
+        </label>
+        <label class="tfield"><span>Held out to score</span>
+          <span class="tinline"><input type="number" id="trainVal" min="5" max="50" step="5"> %</span>
+        </label>
+        <label class="tfield tfield-wide"><span>Save to</span>
+          <input id="trainOutput" placeholder="models/…  (leave empty for an automatic name)" autocomplete="off" spellcheck="false">
+        </label>
+      </section>
+
+      <details class="cli-box" id="trainCliBox">
+        <summary><svg class="ic"><use href="#i-terminal"/></svg> Same thing from the command line</summary>
+        <pre class="mono" id="trainCli"></pre>
+      </details>
+      <div class="picker-error" id="trainError" hidden></div>
+    </div>
+
+    <!-- Models & jobs -->
+    <div class="train-body" id="ttabJobs" hidden>
+      <section class="tsec">
+        <h4 class="tsec-head">Jobs <button class="link-btn" id="clearJobs" title="Take the finished jobs off the list (the models and detections they made are kept)" hidden>CLEAR FINISHED</button></h4>
+        <ul class="job-list" id="jobList"></ul>
+      </section>
+      <section class="tsec">
+        <h4>Trained models</h4>
+        <ul class="model-list" id="modelList"></ul>
+      </section>
+    </div>
+
+    <div class="picker-foot" id="trainFoot">
+      <span class="picker-hint" id="trainHint"></span>
+      <button class="btn btn-quiet" id="trainCancel">Close</button>
+      <button class="btn btn-primary" id="trainGo"><svg class="ic"><use href="#i-cpu"/></svg> Start training</button>
     </div>
   </div>
 </div>

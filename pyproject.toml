@@ -9,9 +9,15 @@ dependencies = [
     "fastapi>=0.142.2",
     "numpy>=2.5.3",
     "python-dotenv>=1.2.3",
-    "rfdetr>=1.11.0",
+    "rfdetr[train]>=1.11.0",
     "supervision>=0.30.5",
     "trackers>=2.6.0",
     "ultralytics>=8.4.162",
     "uvicorn>=0.54.0",
 ]
+
+[tool.uv]
+# rfdetr[train] pulls in roboflow, which pins opencv-python-headless 4.10.
+# Both packages install the same `cv2` module, so the headless one would
+# replace opencv-python's. roboflow's upload helpers are not used here.
+override-dependencies = ["opencv-python-headless; sys_platform == 'never'"]

@@ -280,6 +280,7 @@ kbd {
   position: absolute; bottom: 84px; left: 50%; transform: translateX(-50%);
   background: #111827; color: #fff; padding: 9px 16px; border-radius: 10px;
   font-size: 13px; box-shadow: var(--shadow); pointer-events: none; white-space: nowrap;
+  z-index: 60; /* above the dialogs */
 }
 
 /* ---------- Annotation editor ---------- */
@@ -495,3 +496,131 @@ kbd {
 .btn-quiet { background: none; color: var(--ink-2); }
 .btn-quiet:hover { background: var(--line-2); }
 body.required .picker #openClose, body.required .picker #openCancel { display: none; }
+
+/* ---------- Train a model / jobs ---------- */
+.train { width: min(820px, calc(100vw - 32px)); display: flex; flex-direction: column; overflow: hidden; }
+.train .modal-head { gap: 16px; }
+.train-tabs { margin: -14px 0 -15px auto; border-bottom: 0; }
+.train-tabs .tab { flex: none; padding: 16px 12px 13px; font-size: 14px; display: inline-flex; gap: 6px; align-items: center; }
+.train-body { padding: 14px 22px 6px; overflow-y: auto; min-height: 0; flex: 1; display: flex; flex-direction: column; gap: 14px; }
+.train-intro { margin: 0; color: var(--muted); font-size: 13.5px; }
+.tsec-head { display: flex; align-items: center; justify-content: space-between; }
+.tsec-head .link-btn { text-transform: none; letter-spacing: 0; }
+.tsec h4 { margin: 0 0 7px; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--accent); }
+.tgrid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 22px; }
+.tgrid h4 { grid-column: 1 / -1; margin-bottom: 0; }
+.tfield { display: grid; grid-template-columns: 130px minmax(0, 1fr); align-items: center; gap: 10px; font-size: 13.5px; color: var(--ink-2); }
+.tfield-wide { grid-column: 1 / -1; }
+.tfield input, .tfield select, .run-form input, .run-form select {
+  height: 34px; min-width: 0; width: 100%; padding: 0 10px;
+  border: 1px solid var(--line); border-radius: 8px; background: #fff; outline: none;
+}
+.tfield input:focus, .tfield select:focus, .run-form input:focus, .run-form select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.tfield-wide input { font-family: var(--mono); font-size: 13px; }
+.tinline { display: flex; align-items: center; gap: 8px; color: var(--muted); }
+.tinline input { width: 80px; flex: none; }
+.tnote { grid-column: 1 / -1; font-size: 12.5px; color: var(--muted); }
+.tnote.warn { color: #b45309; }
+
+.train-files {
+  list-style: none; margin: 0; padding: 4px; max-height: 220px; overflow-y: auto;
+  border: 1px solid var(--line); border-radius: 10px; background: #fafafa;
+}
+.train-files:empty::after { content: "No detections files found under the folder."; display: block; padding: 14px; text-align: center; color: var(--faint); font-size: 13px; }
+.tfile {
+  display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 1px 10px; align-items: center;
+  padding: 7px 10px; border-radius: 8px; cursor: pointer; border: 1px solid transparent;
+}
+.tfile:hover { background: #fff; border-color: var(--line); }
+.tfile.on { background: var(--accent-soft); border-color: var(--accent-line); }
+.tfile.disabled { opacity: .55; cursor: default; }
+.tfile input { grid-row: span 2; margin: 0; width: 16px; height: 16px; accent-color: var(--accent); }
+.tfile .pick-name { font-size: 13.5px; }
+.tfile .pick-video { grid-column: 2; }
+.tfile .pick-meta { grid-row: span 2; }
+
+.train-classes { display: flex; flex-wrap: wrap; gap: 6px; }
+.train-classes:empty::after { content: "Choose detections files first."; color: var(--faint); font-size: 13px; }
+.cls-check {
+  display: inline-flex; align-items: center; gap: 7px; height: 30px; padding: 0 11px 0 9px;
+  border: 1px solid var(--line); border-radius: 999px; background: #fff; font-size: 13px; cursor: pointer;
+}
+.cls-check input { margin: 0; accent-color: var(--accent); }
+.cls-check .sw { width: 9px; height: 9px; border-radius: 3px; }
+.cls-check .n { color: var(--faint); font-family: var(--mono); font-size: 11.5px; }
+
+.cli-box { border: 1px solid var(--line); border-radius: 10px; background: #fafafa; }
+.cli-box summary { display: flex; align-items: center; gap: 7px; padding: 8px 12px; cursor: pointer; font-size: 13px; color: var(--ink-2); list-style: none; }
+.cli-box summary::-webkit-details-marker { display: none; }
+.cli-box summary .ic { width: 15px; height: 15px; color: var(--muted); }
+.cli-box pre, .job-log {
+  margin: 0; padding: 10px 12px; border-top: 1px solid var(--line);
+  font-size: 12px; line-height: 1.5; white-space: pre-wrap; word-break: break-all; color: var(--ink-2);
+  user-select: text;
+}
+
+/* Jobs */
+.job-list, .model-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.job-list:empty::after { content: "No jobs yet. Start one from New model, or run a model below."; color: var(--faint); font-size: 13px; }
+.model-list:empty::after { content: "No trained models under the folder yet."; color: var(--faint); font-size: 13px; }
+.job, .model {
+  border: 1px solid var(--line); border-radius: 10px; padding: 11px 14px; background: #fff;
+  display: flex; flex-direction: column; gap: 8px;
+}
+.job-head, .model-head { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.job-title, .model-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.job-head .grow, .model-head .grow { flex: 1; }
+.job-time, .model-meta { font-size: 12px; color: var(--muted); white-space: nowrap; }
+.chip.running { background: #fffbeb; color: #b45309; }
+.chip.done { background: #f0fdf4; color: #15803d; }
+.chip.failed { background: #fff1f2; color: var(--danger); }
+.chip.stopped { background: var(--line-2); color: var(--ink-2); }
+.job-phase { font-size: 13px; color: var(--ink-2); display: flex; justify-content: space-between; gap: 12px; }
+.job-phase .mono { color: var(--muted); font-size: 12px; white-space: nowrap; }
+.meter { height: 6px; border-radius: 999px; background: var(--line-2); overflow: hidden; }
+.meter i { display: block; height: 100%; width: 0; background: var(--accent); border-radius: inherit; transition: width .3s; }
+.meter.indeterminate i { width: 30%; animation: slide 1.2s ease-in-out infinite; }
+@keyframes slide { from { margin-left: -30%; } to { margin-left: 100%; } }
+.job-actions, .model-actions { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.job-actions .grow { flex: 1; }
+.job details summary { cursor: pointer; font-size: 12.5px; color: var(--muted); }
+.job-log { max-height: 220px; overflow-y: auto; border: 1px solid var(--line); border-radius: 8px; margin-top: 6px; background: #fafafa; }
+
+.scores { display: flex; gap: 14px; align-items: flex-end; flex-wrap: wrap; }
+.score { display: flex; flex-direction: column; }
+.score b { font: 600 17px var(--mono); }
+.score span { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
+.spark { flex: 1; min-width: 160px; height: 38px; }
+.spark path { fill: none; stroke: var(--accent); stroke-width: 1.8; }
+.spark circle { fill: var(--accent); }
+.spark .base { stroke: var(--line); stroke-width: 1; }
+
+.model-classes { display: flex; gap: 4px; flex-wrap: wrap; }
+.run-form { display: grid; grid-template-columns: minmax(0, 1fr) 110px auto; gap: 8px; align-items: end; padding-top: 4px; border-top: 1px dashed var(--line); }
+.run-form label { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--muted); }
+.run-form select[name="video"] { font-family: var(--mono); font-size: 12.5px; flex: 1; min-width: 0; }
+.video-pick { display: flex; gap: 6px; align-items: center; }
+.video-pick .btn { height: 34px; flex: none; }
+.run-form .run-open { grid-column: 1 / -1; flex-direction: row; align-items: center; gap: 7px; font-size: 12.5px; color: var(--ink-2); cursor: pointer; }
+.run-form .run-open input { width: auto; height: auto; margin: 0; accent-color: var(--accent); }
+
+/* Topbar job indicator */
+.job-pill {
+  display: inline-flex; align-items: center; gap: 8px; height: 32px; padding: 0 12px;
+  border-radius: 999px; border: 2px solid #c7d7fe; background: var(--accent-soft); color: var(--accent);
+  font-size: 12.5px; font-weight: 600; margin-right: 4px; white-space: nowrap; max-width: 300px;
+}
+.job-pill-dot { width: 7px; height: 7px; background: currentColor; border-radius: 50%; animation: pulse 1s infinite; flex: none; }
+.job-pill-txt { overflow: hidden; text-overflow: ellipsis; }
+.job-pill-bar { width: 46px; height: 4px; border-radius: 999px; background: #c7d7fe; overflow: hidden; flex: none; }
+.job-pill-bar i { display: block; height: 100%; width: 0; background: var(--accent); }
+.job-pill[data-state="done"] { color: #15803d; background: #f0fdf4; border-color: #bbf7d0; }
+.job-pill[data-state="failed"] { color: var(--danger); background: #fff1f2; border-color: #fda4af; }
+.job-pill:not([data-state="running"]) .job-pill-dot { animation: none; }
+.job-pill:not([data-state="running"]) .job-pill-bar { display: none; }
+
+@media (max-width: 700px) {
+  .tgrid { grid-template-columns: 1fr; }
+  .tfield { grid-template-columns: 110px minmax(0, 1fr); }
+  .run-form { grid-template-columns: 1fr; }
+}

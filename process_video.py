@@ -21,6 +21,7 @@ from tqdm import tqdm
 
 from cli import (
     DEFAULT_DETECTOR,
+    DEFAULT_THRESHOLD,
     DEFAULT_HOLD_FRAMES,
     DEFAULT_SAMPLE_RATES,
     DETECTORS,
@@ -55,7 +56,11 @@ from options import (
     resolve_class,
     split_tokens,
 )
-from rfdetr_detector import RfDetrDetector
+from rfdetr_detector import (
+    RfDetrDetector,
+    recommended_threshold,
+    weights_path,
+)
 
 # Load ANTHROPIC_API_KEY etc. from .env next to this script (and from
 # the current directory). Variables already set in the shell win.
@@ -94,12 +99,52 @@ def main() -> None:
     else:
         detector = args.detector
 
-    # Cloud / locate-anything take free-form class names; RF-DETR only
-    # knows the COCO classes.
-    open_vocab = detector in OPEN_VOCAB_DETECTORS
+    # A fine-tuned model comes with the threshold chosen when it was
+    # trained (best F1 on its validation frames).
+    if args.threshold is None:
+        recommended = (
+            recommended_threshold(args.weights) if args.weights else None
+        )
+        args.threshold = recommended or DEFAULT_THRESHOLD
+        if recommended:
+            print(
+                f"Threshold {recommended:g}, chosen for this model when it "
+                "was trained (change it with --threshold)"
+            )
+
+    # A fine-tuned RF-DETR (--weights) knows its own classes, so it is
+    # loaded before the classes are resolved.
+    rfdetr_detector: RfDetrDetector | None = None
+    if loaded is None and args.weights:
+        detector = "rfdetr"
+        try:
+            rfdetr_detector = RfDetrDetector(
+                args.model, args.threshold, weights=args.weights
+            )
+        except ValueError as exc:
+            sys.exit(f"error: {exc}")
+
+    # Which names --classes takes (the class namespace):
+    # - the stock RF-DETR: the fixed COCO classes (with COCO's ids);
+    # - a fine-tuned RF-DETR: the classes it was trained on;
+    # - cloud / locate-anything: free-form text, and so is a saved file
+    #   of a fine-tuned model (it is matched to the classes by name).
+    model_classes = (
+        dict(enumerate(rfdetr_detector.class_names))
+        if rfdetr_detector is not None
+        else None
+    )
+    free_classes = detector in OPEN_VOCAB_DETECTORS or bool(
+        loaded is not None and loaded.info.get("weights")
+    )
+    coco_classes = model_classes is None and not free_classes
 
     if args.list_classes:
-        if open_vocab:
+        if model_classes is not None:
+            for class_id, name in model_classes.items():
+                print(f"{class_id:3d}  {name}")
+            return
+        if free_classes:
             print(
                 "With --detector cloud or locate-anything, --classes accepts "
                 "any free-form text (e.g. 'traffic cone', "
@@ -112,24 +157,52 @@ def main() -> None:
 
     # -- Validate / resolve options --------------------------------
     # `coco` maps class id -> name for every class we can track.
-    # RF-DETR: the fixed COCO set. Cloud/locate-anything: whatever the
-    # user typed.
+    # RF-DETR: the fixed COCO set, or the fine-tuned model's classes.
+    # Cloud/locate-anything: whatever the user typed.
+    # There is no default set of classes: what to detect is always
+    # given, except where it is already known (the classes a fine-tuned
+    # model was trained on, or those chosen when a cloud /
+    # locate-anything / fine-tuned file was detected).
+    no_classes = (
+        "error: --classes is required: say what to detect, e.g. "
+        + (
+            "--classes \"traffic cone\" (free-form text)"
+            if free_classes
+            else "--classes car truck (see --list-classes)"
+        )
+    )
     try:
-        if open_vocab:
-            coco = build_free_classes(split_tokens(args.classes))
-            class_ids = list(coco)
-        else:
-            coco = load_coco_classes()
-            class_ids = list(
-                dict.fromkeys(  # dedupe, keep order
-                    resolve_class(t, coco)
-                    for t in split_tokens(args.classes)
-                )
+        if model_classes is not None:
+            coco = model_classes
+            tokens = (
+                split_tokens(args.classes)
+                if args.classes
+                else list(coco.values())
             )
+        elif free_classes:
+            if args.classes:
+                tokens = split_tokens(args.classes)
+            elif loaded is not None:
+                tokens = [c["name"] for c in loaded.categories]
+            else:
+                sys.exit(no_classes)
+            coco = build_free_classes(tokens)
+        else:
+            # A stock RF-DETR file holds every COCO class it found, so it
+            # doesn't say what to detect either.
+            if not args.classes:
+                sys.exit(no_classes)
+            coco = load_coco_classes()
+            tokens = split_tokens(args.classes)
+        class_ids = list(
+            dict.fromkeys(  # dedupe, keep order
+                resolve_class(t, coco) for t in tokens
+            )
+        )
         if not class_ids:
             raise ValueError("--classes: no classes given")
         color_map = build_color_map(
-            class_ids, args.colors, coco, use_defaults=not open_vocab
+            class_ids, args.colors, coco, use_defaults=coco_classes
         )
         hud_rows = build_hud_rows(args.hud_rows, class_ids, coco)
         line_color = parse_color(args.line_color)
@@ -146,7 +219,8 @@ def main() -> None:
         if args.output
         else Path.cwd() / f"{source_path.stem}_counted.mp4"
     )
-    target_path.parent.mkdir(parents=True, exist_ok=True)
+    if not args.no_render:
+        target_path.parent.mkdir(parents=True, exist_ok=True)
 
     # -- Video ------------------------------------------------------
     video_info = sv.VideoInfo.from_video_path(str(source_path))
@@ -414,7 +488,8 @@ def main() -> None:
         )
 
     else:
-        rfdetr_detector = RfDetrDetector(args.model, args.threshold)
+        if rfdetr_detector is None:
+            rfdetr_detector = RfDetrDetector(args.model, args.threshold)
         print(
             f"RF-DETR detector: {effective_rate:g} frames/s "
             f"(one detection every {sample_step:g} frames, "
@@ -433,7 +508,9 @@ def main() -> None:
                 ).items()
             }
 
-        detector_meta = {"model": args.model}
+        detector_meta = {"model": rfdetr_detector.size}
+        if args.weights:
+            detector_meta["weights"] = str(weights_path(args.weights))
 
     def write_detections() -> None:
         """Save --save-detections (raw, before tracking)."""
@@ -468,11 +545,11 @@ def main() -> None:
             detections_by_frame,
             label_of=lambda class_id: coco.get(class_id, str(class_id)),
             # RF-DETR class ids are COCO's category ids; free-form
-            # classes are numbered from 0.
+            # classes and a fine-tuned model's are numbered from 0.
             category_id_of=(
-                (lambda class_id: class_id + 1)
-                if open_vocab
-                else (lambda class_id: class_id)
+                (lambda class_id: class_id)
+                if coco_classes
+                else (lambda class_id: class_id + 1)
             ),
             class_ids=class_ids,
         )
@@ -481,6 +558,10 @@ def main() -> None:
     # Detection is done already; save right away so the (slow / paid)
     # detections survive a failure while rendering.
     write_detections()
+    if args.no_render:
+        if detector_stats:
+            print(detector_stats)
+        return
 
     # -- Tracker ----------------------------------------------------
     # The tracker only ever sees sampled frames, so it has to be told
@@ -493,7 +574,9 @@ def main() -> None:
     # found again (--interpolate).
     hold_frames = args.hold_frames
     if hold_frames is None:
-        hold_frames = DEFAULT_HOLD_FRAMES if open_vocab else 0
+        hold_frames = (
+            DEFAULT_HOLD_FRAMES if detector in OPEN_VOCAB_DETECTORS else 0
+        )
 
     byte_tracker = ByteTrackTracker(
         # The tracker has to keep the id of a track across those missed

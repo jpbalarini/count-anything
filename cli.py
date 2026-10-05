@@ -21,7 +21,7 @@ from locate_anything_detector import (
 )
 from rfdetr_detector import DEFAULT_MODEL_SIZE, MODEL_SIZES
 
-DEFAULT_CLASSES = ["car", "motorcycle", "bus", "truck"]
+DEFAULT_THRESHOLD = 0.2
 DEFAULT_LINE_COLOR = "#F59E0B"  # amber
 
 DETECTORS = ["rfdetr", "cloud", "locate-anything"]
@@ -62,6 +62,9 @@ Detectors
                           to load the model once (else
                           `locate-anything-cli` in PATH is used, which
                           reloads it on every frame).
+  --weights models/NAME   an RF-DETR fine-tuned with train_rfdetr.py on
+                          detections saved by any detector; it knows
+                          only the classes it was trained on.
 
 Speed / iteration
 -----------------
@@ -71,12 +74,15 @@ Speed / iteration
   --save-detections f.json   write the raw detections to a JSON file
   --load-detections f.json   skip detection, reuse a saved JSON (change
                           colors, HUD, line, classes... and re-render)
+  --no-render             only detect and save (--save-detections), e.g.
+                          to review the boxes in the annotator first
 
 Examples
 --------
-Minimal (cars, motorcycles, buses and trucks, horizontal line mid-frame):
+Minimal (cars, horizontal line mid-frame). --classes is required: there
+is no default, say what to detect:
 
-    python process_video.py input.mp4
+    python process_video.py input.mp4 --classes car
 
 Only cars and trucks, custom colors, custom line, one-way counting:
 
@@ -105,13 +111,21 @@ classes (quote multi-word names or separate them with commas):
 
 Detect once at 720p, then tweak the look without detecting again:
 
-    python process_video.py input.mp4 --infer-resolution 720 \\
+    python process_video.py input.mp4 --classes car --infer-resolution 720 \\
         --save-detections dets.json
     python process_video.py input.mp4 --load-detections dets.json \\
-        --hud-title "NEW TITLE" --colors car=#FF0000
+        --classes car --hud-title "NEW TITLE" --colors car=#FF0000
+
+Label some frames with a big model, fine-tune a small RF-DETR on them,
+then run it on every frame (see train_rfdetr.py --help):
+
+    python process_video.py input.mp4 --detector cloud --classes apple \
+        --save-detections dets.json --no-render
+    python train_rfdetr.py dets.json -o models/apples
+    python process_video.py input.mp4 --weights models/apples
 
 Run `python process_video.py --list-classes` to see the available class ids
-(rfdetr detector only).
+(rfdetr detector only; with --weights, the model's classes).
 """
 
 
@@ -149,14 +163,15 @@ def parse_args() -> argparse.Namespace:
     det.add_argument(
         "--classes",
         nargs="+",
-        default=DEFAULT_CLASSES,
         metavar="CLASS",
         help=(
-            "Class ids or names to detect, e.g. `3 8` or "
+            "What to detect (required): class ids or names, e.g. `3 8` or "
             "`car truck` or `car,truck`. With --detector cloud or "
             "locate-anything these are free-form text, not limited to COCO, e.g. "
-            "`\"traffic cone\" \"person wearing a helmet\"` "
-            f"(default: {' '.join(DEFAULT_CLASSES)})."
+            "`\"traffic cone\" \"person wearing a helmet\"`. Optional "
+            "with --weights (default: every class of the model) and with "
+            "--load-detections of a cloud / locate-anything / --weights "
+            "file (default: the file's classes)."
         ),
     )
     det.add_argument(
@@ -173,13 +188,28 @@ def parse_args() -> argparse.Namespace:
         "--model",
         choices=MODEL_SIZES,
         default=DEFAULT_MODEL_SIZE,
-        help=f"RF-DETR model size (default: {DEFAULT_MODEL_SIZE}).",
+        help=(
+            f"RF-DETR model size (default: {DEFAULT_MODEL_SIZE}). Ignored "
+            "with --weights."
+        ),
+    )
+    det.add_argument(
+        "--weights",
+        metavar="PATH",
+        help=(
+            "Use an RF-DETR fine-tuned by train_rfdetr.py: its output "
+            "folder or a .pth checkpoint. Implies --detector rfdetr; "
+            "--classes are the model's classes."
+        ),
     )
     det.add_argument(
         "--threshold",
         type=float,
-        default=0.2,
-        help="Detection confidence threshold (default: 0.2).",
+        default=None,
+        help=(
+            f"Detection confidence threshold (default: {DEFAULT_THRESHOLD:g}; "
+            "with --weights, the one train_rfdetr.py chose for the model)."
+        ),
     )
     det.add_argument(
         "--track-threshold",
@@ -269,6 +299,15 @@ def parse_args() -> argparse.Namespace:
         "--url",
         default="",
         help="info.url of the --save-detections file.",
+    )
+    speed.add_argument(
+        "--no-render",
+        action="store_true",
+        help=(
+            "Stop after detection: write --save-detections and no video "
+            "(review the boxes in the annotator, train on them, or render "
+            "later with --load-detections)."
+        ),
     )
     speed.add_argument(
         "--load-detections",
@@ -490,12 +529,13 @@ def parse_args() -> argparse.Namespace:
         "--min-display-size",
         nargs=2,
         type=int,
-        default=[35, 25],
+        default=[0, 0],
         metavar=("W", "H"),
         help=(
-            "Minimum box size in pixels. Boxes smaller than W x H are "
-            "filtered out (default: 35 25). `0 0` disables the "
-            "minimum."
+            "Minimum box size in pixels, e.g. `35 25` to hide far-away "
+            "elements. Boxes smaller than W x H are filtered out "
+            "(default: 0 0, no minimum). Pixels of the video, so the "
+            "right value depends on its resolution."
         ),
     )
     size.add_argument(
@@ -560,4 +600,11 @@ def parse_args() -> argparse.Namespace:
         p.error(
             "--save-detections and --load-detections can't be combined"
         )
+    if args.no_render and not args.save_detections:
+        p.error("--no-render needs --save-detections")
+    if args.weights and args.load_detections:
+        p.error("--weights and --load-detections can't be combined")
+    if args.weights and args.detector not in (DEFAULT_DETECTOR, "rfdetr"):
+        p.error("--weights is an RF-DETR model, it can't be used with "
+                f"--detector {args.detector}")
     return args

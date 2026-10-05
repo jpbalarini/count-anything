@@ -102,12 +102,23 @@ function pref(key, value) {
 }
 
 let toastTimer = null;
-function toast(msg) {
+function toast(msg, ms = 2200) {
   const t = $('#toast');
   t.textContent = msg;
   t.hidden = false;
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => { t.hidden = true; }, 2200);
+  toastTimer = setTimeout(() => { t.hidden = true; }, ms);
+}
+
+// The server runs the code it was started with; after an update the page
+// can be newer than it (see CodeWatch in annotate_server.py).
+const OUTDATED = 'annotate_server.py changed since it was started: restart it to use the new version.';
+let warnedOutdated = false;
+function checkOutdated(res) {
+  if (res.headers.get('X-Server-Outdated') && !warnedOutdated) {
+    warnedOutdated = true;
+    toast(OUTDATED, 10000);
+  }
 }
 
 async function api(url, opts = {}) {
@@ -116,9 +127,12 @@ async function api(url, opts = {}) {
     ...opts,
     body: opts.body ? JSON.stringify(opts.body) : undefined,
   });
+  checkOutdated(res);
   if (!res.ok) {
     let detail = await res.text();
     try { detail = JSON.parse(detail).detail ?? detail; } catch { /* not JSON */ }
+    // An endpoint the running server doesn't have yet.
+    if (res.status === 405 || (res.status === 404 && detail === 'Not Found')) detail = OUTDATED;
     const err = new Error(String(detail));
     err.status = res.status;
     throw err;
@@ -525,8 +539,10 @@ function step(delta) {
     if (pos < 0 || pos >= S.indices.length) break;
     if (navigable(pos)) { target = pos; left--; }
   }
-  if (target !== S.pos) goTo(target);
-  return target !== S.pos;
+  // goTo() moves S.pos right away, so decide before calling it.
+  const moved = target !== S.pos;
+  if (moved) goTo(target);
+  return moved;
 }
 
 let onionBoxes = null;
@@ -540,15 +556,16 @@ async function togglePlay() {
   S.playing = !S.playing;
   $('#playBtn').innerHTML = icon(S.playing ? 'pause' : 'play');
   if (!S.playing) return;
+  // From the last frame, play from the start.
+  if (!step(1)) await goTo(0);
   const meta = S.project.meta;
   const sampleFps = (S.project.fps || 30) / (meta.sample_step || 1);
   const delay = 1000 / clamp(sampleFps, 1, 12);
   while (S.playing) {
     const t0 = performance.now();
-    const moved = step(1);
-    if (!moved) break;
-    await new Promise((r) => setTimeout(r, Math.max(0, delay - (performance.now() - t0))));
     while (S.playing && !S.loaded) await new Promise((r) => setTimeout(r, 20));
+    await new Promise((r) => setTimeout(r, Math.max(0, delay - (performance.now() - t0))));
+    if (!S.playing || !step(1)) break;
   }
   S.playing = false;
   $('#playBtn').innerHTML = icon('play');
@@ -1523,9 +1540,9 @@ function wireUi() {
     e.target.closest('button')?.blur();
   });
 
-  for (const t of document.querySelectorAll('.tab')) {
+  for (const t of document.querySelectorAll('.ann-panel .tab')) {
     t.addEventListener('click', () => {
-      for (const o of document.querySelectorAll('.tab')) o.classList.toggle('active', o === t);
+      for (const o of document.querySelectorAll('.ann-panel .tab')) o.classList.toggle('active', o === t);
       $('#classesTab').hidden = t.dataset.tab !== 'classes';
       $('#layersTab').hidden = t.dataset.tab !== 'layers';
     });
@@ -1589,7 +1606,7 @@ window.addEventListener('keydown', (e) => {
   const mod = e.metaKey || e.ctrlKey;
   const k = e.key.toLowerCase();
 
-  if (!$('#openModal').hidden) return;
+  if (!$('#openModal').hidden || !$('#trainModal').hidden) return;
   if (mod && k === 'o') { e.preventDefault(); openPicker(); return; }
   if (mod) {
     if (k === 'z') { e.preventDefault(); if (e.shiftKey) redo(); else undo(); }
@@ -1656,6 +1673,7 @@ window.addEventListener('keydown', (e) => {
     case 'e': toggle('hideAll'); break;
     case 'f': fitView(); break;
     case 'p': togglePlay(); break;
+    case 't': openTrain(T.jobs.some((j) => j.status === 'running') ? 'jobs' : 'new'); break;
   }
 });
 
@@ -1821,12 +1839,620 @@ function wirePicker() {
 }
 
 // ------------------------------------------------------------------
+// Train a model (train_rfdetr.py) / run it (process_video.py), as jobs
+// ------------------------------------------------------------------
+
+const T = {
+  files: [],             // detections files under the root
+  videos: [],
+  models: [],
+  defaults: null,
+  chosen: new Set(),     // detections paths to train on
+  classes: new Map(),    // class name -> checked
+  jobs: [],
+  logs: new Map(),       // job id -> log lines (for the open logs)
+  openLogs: new Set(),
+  runFor: null,          // model path whose "run on a video" form is open
+  run: null,             // that form's choices (video, open when done)
+  openWhenDone: new Set(), // detection jobs whose results open when they finish
+  unseen: null,          // id of a job that ended since the jobs were last looked at
+  pollTimer: null,
+  previewTimer: null,
+  formReady: false,
+};
+
+const fmtNum = (v, d = 3) => (v == null ? '–' : Number(v).toFixed(d));
+
+function fmtDuration(seconds) {
+  const s = Math.max(0, Math.round(seconds));
+  if (s < 60) return `${s} s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m} min ${s % 60} s`;
+  return `${Math.floor(m / 60)} h ${m % 60} min`;
+}
+
+async function openTrain(tab = 'new') {
+  closePopups();
+  closeEditor();
+  $('#trainModal').hidden = false;
+  showTrainTab(tab);
+  await loadTrainData();
+}
+
+function closeTrain() {
+  $('#trainModal').hidden = true;
+}
+
+function showTrainTab(tab) {
+  T.tab = tab;
+  for (const b of document.querySelectorAll('[data-ttab]')) b.classList.toggle('active', b.dataset.ttab === tab);
+  $('#ttabNew').hidden = tab !== 'new';
+  $('#ttabJobs').hidden = tab !== 'jobs';
+  $('#trainGo').hidden = tab !== 'new';
+  $('#trainHint').textContent = tab === 'new' ? 'Training runs in the background; you can keep annotating.' : '';
+  if (tab === 'jobs') {
+    T.unseen = null;
+    renderJobPill();
+    renderJobs();
+    renderModels();
+  }
+}
+
+async function loadTrainData() {
+  try {
+    const [files, models] = await Promise.all([api('/api/files'), api('/api/models')]);
+    T.files = files.detections;
+    T.videos = files.videos;
+    T.models = models.models;
+    T.defaults = models.defaults;
+  } catch (err) {
+    showTrainError(`Could not list the files: ${err.message}`);
+    return;
+  }
+  if (!T.formReady) {
+    const d = T.defaults;
+    $('#trainModel').innerHTML = d.models.map((m) => `<option value="${m}">${m}${m === d.model ? ' (recommended)' : ''}</option>`).join('');
+    $('#trainModel').value = d.model;
+    $('#trainEpochs').value = d.epochs;
+    $('#trainBatch').value = d.batch_size;
+    $('#trainMinScore').value = d.min_score;
+    $('#trainVal').value = Math.round(d.val_fraction * 100);
+    const current = S.project?.detections_path;
+    if (current && T.files.some((f) => f.path === current && f.video)) T.chosen.add(current);
+    T.formReady = true;
+  }
+  // Forget files that are gone.
+  for (const p of [...T.chosen]) if (!T.files.some((f) => f.path === p)) T.chosen.delete(p);
+  renderTrainFiles();
+  renderTrainClasses();
+  updateTrainForm();
+  renderModels();
+  pollJobs();
+}
+
+function chosenFiles() {
+  return T.files.filter((f) => T.chosen.has(f.path));
+}
+
+function renderTrainFiles() {
+  const current = S.project?.detections_path;
+  const ul = $('#trainFiles');
+  ul.innerHTML = '';
+  for (const f of T.files) {
+    const li = document.createElement('li');
+    const on = T.chosen.has(f.path);
+    li.className = `tfile${on ? ' on' : ''}${f.video ? '' : ' disabled'}`;
+    const slash = f.path.lastIndexOf('/');
+    const tags = [
+      f.path === current ? '<span class="chip open">open</span>' : '',
+      f.edited ? `<span class="chip edited">${f.edited} edited</span>` : '',
+      `<span class="chip">${esc(f.weights ? 'rfdetr (fine-tuned)' : f.detector || '?')}</span>`,
+    ].join(' ');
+    const classes = Object.keys(f.classes || {}).join(', ') || 'no boxes';
+    li.innerHTML = `<input type="checkbox" ${on ? 'checked' : ''} ${f.video ? '' : 'disabled'}>`
+      + `<div class="pick-name" title="${esc(f.path)}"><span class="dir">${esc(f.path.slice(0, slash + 1))}</span>${esc(f.path.slice(slash + 1))}</div>`
+      + `<div class="pick-meta">${tags}<br>${f.samples ?? '?'} frames</div>`
+      + (f.video
+        ? `<div class="pick-video">${icon('film')}<span title="${esc(f.video)}">${esc(f.video)} · ${esc(classes)}</span></div>`
+        : `<div class="pick-video missing">${icon('film')}<span>video ${esc(f.source || '(not recorded)')} not found under the folder</span></div>`);
+    if (f.video) {
+      li.addEventListener('click', (e) => {
+        if (e.target.tagName !== 'INPUT') li.querySelector('input').checked = !T.chosen.has(f.path);
+        if (T.chosen.has(f.path)) T.chosen.delete(f.path); else T.chosen.add(f.path);
+        li.classList.toggle('on', T.chosen.has(f.path));
+        renderTrainClasses();
+        updateTrainForm();
+      });
+    }
+    ul.append(li);
+  }
+}
+
+function renderTrainClasses() {
+  const counts = new Map();
+  for (const f of chosenFiles()) {
+    for (const [name, n] of Object.entries(f.classes || {})) {
+      const key = [...counts.keys()].find((k) => norm(k) === norm(name)) ?? name;
+      counts.set(key, (counts.get(key) || 0) + n);
+    }
+  }
+  const box = $('#trainClasses');
+  box.innerHTML = '';
+  for (const [name, n] of counts) {
+    if (!T.classes.has(name)) T.classes.set(name, true);
+    const label = document.createElement('label');
+    label.className = 'cls-check';
+    label.innerHTML = `<input type="checkbox" ${T.classes.get(name) ? 'checked' : ''}>`
+      + `<span class="sw" style="background:${colorOf(name)}"></span>${esc(name)} <span class="n">${n}</span>`;
+    label.querySelector('input').addEventListener('change', (e) => {
+      T.classes.set(name, e.target.checked);
+      updateTrainForm();
+    });
+    box.append(label);
+  }
+}
+
+function selectedClasses() {
+  const all = [];
+  const counts = new Set();
+  for (const f of chosenFiles()) for (const c of Object.keys(f.classes || {})) counts.add(norm(c));
+  for (const [name, on] of T.classes) if (on && counts.has(norm(name))) all.push(name);
+  return { picked: all, total: counts.size };
+}
+
+function trainBody() {
+  const { picked, total } = selectedClasses();
+  const num = (sel, fallback) => {
+    const v = Number($(sel).value);
+    return Number.isFinite(v) && $(sel).value !== '' ? v : fallback;
+  };
+  return {
+    detections: chosenFiles().map((f) => f.path),
+    // All classes = the default (every class with boxes).
+    classes: picked.length === total ? null : picked,
+    model: $('#trainModel').value,
+    epochs: num('#trainEpochs', T.defaults.epochs),
+    batch_size: num('#trainBatch', T.defaults.batch_size),
+    every: num('#trainEvery', 1),
+    only_edited: $('#trainFrames').value === 'edited',
+    min_score: num('#trainMinScore', T.defaults.min_score),
+    val_fraction: num('#trainVal', T.defaults.val_fraction * 100) / 100,
+    image_size: T.defaults.image_size,
+    output: $('#trainOutput').value.trim() || null,
+  };
+}
+
+function updateTrainForm() {
+  const files = chosenFiles();
+  const onlyEdited = $('#trainFrames').value === 'edited';
+  const every = Math.max(1, Number($('#trainEvery').value) || 1);
+  const frames = files.reduce((n, f) => n + Math.ceil((onlyEdited ? f.edited : (f.samples - (f.failed || 0))) / every), 0);
+  const { picked } = selectedClasses();
+  $('#trainMinScoreRow').hidden = !files.some((f) => f.scored);
+  const note = $('#trainFrameNote');
+  note.classList.toggle('warn', files.length > 0 && frames < 30);
+  note.textContent = !files.length ? ''
+    : `About ${frames} frames to train on (${Math.round(Number($('#trainVal').value) || 20)}% held out to score the model)`
+      + (frames < 30 ? '. That is few: the model may not learn much; review more frames or add files.' : '.')
+      + (onlyEdited ? '' : ' Unreviewed boxes are learned as they are, mistakes included.');
+  const ok = files.length > 0 && picked.length > 0 && frames > 0;
+  $('#trainGo').disabled = !ok;
+  $('#trainError').hidden = true;
+  clearTimeout(T.previewTimer);
+  if (!ok) {
+    $('#trainCli').textContent = files.length ? 'Choose at least one class.' : 'Choose the detections files to learn from.';
+    return;
+  }
+  T.previewTimer = setTimeout(previewTraining, 250);
+}
+
+async function previewTraining() {
+  try {
+    const r = await api('/api/jobs/train?dry=1', { method: 'POST', body: trainBody() });
+    $('#trainCli').textContent = r.cli;
+    if (T.tab === 'new') $('#trainHint').textContent = `Saves to ${r.result.model}`;
+  } catch (err) {
+    $('#trainCli').textContent = '';
+    showTrainError(err.message);
+  }
+}
+
+function showTrainError(msg) {
+  const el = $('#trainError');
+  el.textContent = msg;
+  el.hidden = false;
+}
+
+async function startTraining() {
+  const btn = $('#trainGo');
+  btn.disabled = true;
+  try {
+    if (S.project && !stale) await flushSave();
+    const job = await api('/api/jobs/train', { method: 'POST', body: trainBody() });
+    T.jobs = [job, ...T.jobs.filter((j) => j.id !== job.id)];
+    $('#trainOutput').value = '';
+    showTrainTab('jobs');
+    pollJobs();
+  } catch (err) {
+    showTrainError(err.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// -- Jobs -------------------------------------------------------------
+
+function jobPhase(job) {
+  const p = job.progress || {};
+  if (job.kind === 'train') {
+    switch (p.phase) {
+      case 'dataset': return { text: `Extracting frames from the videos`, detail: `${p.done}/${p.total}`, frac: 0.05 * p.done / p.total };
+      case 'dataset_done': case 'loading': return { text: `Loading RF-DETR${p.device ? ` on ${p.device}` : ''}`, frac: 0.05 };
+      case 'training': {
+        const frac = ((p.epoch - 1) + p.batch / p.batches) / p.epochs;
+        return { text: `Epoch ${p.epoch} of ${p.epochs}`, detail: `batch ${p.batch}/${p.batches}${p.loss != null ? ` · loss ${fmtNum(p.loss)}` : ''}`, frac: 0.05 + 0.95 * frac };
+      }
+      case 'validated': {
+        const last = p.history?.[p.history.length - 1];
+        return { text: `Epoch ${last?.epoch ?? '?'} of ${p.epochs} scored`, frac: 0.05 + 0.95 * (last?.epoch ?? 0) / p.epochs };
+      }
+      case 'stopping': return { text: 'Stopping: scoring the model one last time…', frac: null };
+      case 'calibrating': return { text: 'Choosing the confidence threshold on the held-out frames', frac: 0.99 };
+      case 'stopped': return { text: 'Stopped before a model was saved', frac: null };
+      case 'done': return { text: p.stopped ? 'Stopped; the best model so far was kept' : 'Done', frac: 1 };
+      default: return { text: job.last_line || 'Starting…', frac: null };
+    }
+  }
+  if (job.status === 'done') return { text: 'Done', detail: p.bar ? `${p.bar.total} frames` : '', frac: 1 };
+  if (p.bar) return { text: p.bar.label, detail: `${p.bar.done}/${p.bar.total}`, frac: p.bar.done / Math.max(1, p.bar.total) };
+  return { text: job.last_line || 'Starting…', frac: null };
+}
+
+function sparkline(values) {
+  const pts = values.filter((v) => v != null);
+  if (pts.length < 2) return '';
+  let lo = Math.min(...pts), hi = Math.max(...pts);
+  if (hi - lo < 0.02) { lo -= 0.01; hi += 0.01; }
+  const w = 200, h = 38, pad = 3;
+  const xy = pts.map((v, i) => [pad + (i * (w - 2 * pad)) / (pts.length - 1), pad + (1 - (v - lo) / (hi - lo)) * (h - 2 * pad)]);
+  const d = xy.map(([x, y], i) => `${i ? 'L' : 'M'}${x.toFixed(1)},${y.toFixed(1)}`).join('');
+  const [lx, ly] = xy[xy.length - 1];
+  return `<svg class="spark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none"><path class="base" d="M${pad},${h - pad}H${w - pad}"/><path d="${d}"/><circle cx="${lx}" cy="${ly}" r="2.5"/></svg>`;
+}
+
+function scoresHtml(history, best) {
+  if (!history?.length) return '';
+  const last = history[history.length - 1];
+  const top = best || history.reduce((a, b) => ((b.map ?? -1) > (a.map ?? -1) ? b : a));
+  return `<div class="scores">`
+    + `<div class="score"><b>${fmtNum(top.map50)}</b><span>best mAP50</span></div>`
+    + `<div class="score"><b>${fmtNum(top.map)}</b><span>mAP50-95</span></div>`
+    + `<div class="score"><b>${fmtNum(last.f1)}</b><span>F1 (last)</span></div>`
+    + sparkline(history.map((e) => e.map50))
+    + `</div>`;
+}
+
+function renderJobs() {
+  const ul = $('#jobList');
+  if ($('#trainModal').hidden || T.tab !== 'jobs') return;
+  // Keep the scroll position of open logs across redraws.
+  const scrolls = new Map([...ul.querySelectorAll('.job-log')].map((el) => [el.dataset.id, el.scrollTop + el.clientHeight >= el.scrollHeight - 4 ? Infinity : el.scrollTop]));
+  ul.innerHTML = '';
+  for (const job of T.jobs) {
+    const li = document.createElement('li');
+    li.className = 'job';
+    const phase = jobPhase(job);
+    const elapsed = (job.ended || Date.now() / 1000) - job.started;
+    const status = job.stopping ? 'stopping' : job.status;
+    const meter = job.status === 'running'
+      ? `<div class="meter${phase.frac == null ? ' indeterminate' : ''}"><i style="width:${((phase.frac ?? 0) * 100).toFixed(1)}%"></i></div>` : '';
+    const history = job.progress?.history;
+    let actions = '';
+    if (job.status === 'running') {
+      actions += `<button class="btn btn-sm btn-danger" data-act="stop" ${job.stopping ? 'disabled' : ''}>${icon('stop')} ${job.kind === 'train' ? 'Stop (keep the best so far)' : 'Stop'}</button>`;
+    } else if (job.kind === 'train' && job.progress?.phase === 'done' && T.models.some((m) => m.path === job.result.model)) {
+      actions += `<button class="btn btn-sm btn-primary" data-act="run">${icon('film')} Run on a video…</button>`;
+    } else if (job.kind === 'detect' && job.status === 'done') {
+      actions += `<button class="btn btn-sm btn-primary" data-act="open">${icon('folder')} Open the detections</button>`;
+    }
+    const where = job.kind === 'train' ? job.result.model : job.result.detections;
+    li.innerHTML = `<div class="job-head"><span class="job-title" title="${esc(job.title)}">${esc(job.title)}</span>`
+      + `<span class="chip ${esc(job.status)}">${esc(status)}</span><span class="grow"></span>`
+      + `<span class="job-time">${fmtDuration(elapsed)}</span>`
+      + (job.status === 'running' ? '' : `<button class="icon-btn sm" data-act="remove" title="Remove from the list (its files are kept)">${icon('x')}</button>`)
+      + `</div>`
+      + `<div class="job-phase"><span>${esc(job.status === 'failed' ? (job.last_line || 'Failed') : phase.text)}</span><span class="mono">${esc(phase.detail || '')}</span></div>`
+      + meter
+      + (job.kind === 'train' ? scoresHtml(history) : '')
+      + `<div class="job-actions">${actions}<span class="grow"></span><span class="job-time mono" title="${esc(where || '')}">${esc(where || '')}</span></div>`
+      + `<details ${T.openLogs.has(job.id) ? 'open' : ''}><summary>Output</summary><pre class="job-log mono" data-id="${job.id}">${esc((T.logs.get(job.id) || []).join('\n'))}</pre></details>`;
+    li.querySelector('details').addEventListener('toggle', (e) => {
+      if (e.target.open) { T.openLogs.add(job.id); loadJobLog(job.id); } else T.openLogs.delete(job.id);
+    });
+    li.querySelector('[data-act="stop"]')?.addEventListener('click', async () => {
+      try { await api(`/api/jobs/${job.id}/stop`, { method: 'POST' }); } catch (err) { toast(err.message); }
+      pollJobs();
+    });
+    li.querySelector('[data-act="run"]')?.addEventListener('click', () => {
+      T.runFor = job.result.model;
+      renderModels();
+      $(`#modelList [data-model="${CSS.escape(job.result.model)}"]`)?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    });
+    li.querySelector('[data-act="open"]')?.addEventListener('click', () => openFiles(job.result.detections, job.result.video));
+    li.querySelector('[data-act="remove"]')?.addEventListener('click', () => removeJobs([job.id]));
+    ul.append(li);
+    const log = li.querySelector('.job-log');
+    const keep = scrolls.get(job.id);
+    log.scrollTop = keep === undefined || keep === Infinity ? log.scrollHeight : keep;
+  }
+  const running = T.jobs.filter((j) => j.status === 'running').length;
+  $('#clearJobs').hidden = T.jobs.length === running;
+  $('#jobsCount').hidden = !running;
+  $('#jobsCount').textContent = running;
+}
+
+async function loadJobLog(id) {
+  try {
+    const job = await api(`/api/jobs/${id}`);
+    T.logs.set(id, job.log);
+    const pre = document.querySelector(`.job-log[data-id="${id}"]`);
+    if (pre) {
+      const atEnd = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 4;
+      pre.textContent = job.log.join('\n');
+      if (atEnd) pre.scrollTop = pre.scrollHeight;
+    }
+  } catch { /* the next poll retries */ }
+}
+
+function renderModels() {
+  const ul = $('#modelList');
+  if ($('#trainModal').hidden || T.tab !== 'jobs') return;
+  ul.innerHTML = '';
+  for (const m of T.models) {
+    const li = document.createElement('li');
+    li.className = 'model';
+    li.dataset.model = m.path;
+    const classes = m.classes.map((c) => `<span class="chip">${esc(c)}</span>`).join('');
+    const imgs = m.images ? `${m.images.train} + ${m.images.valid} frames` : '';
+    li.innerHTML = `<div class="model-head"><span class="model-name" title="${esc(m.path)}">${esc(m.name)}</span>`
+      + `<span class="chip">${esc(m.base_model || '?')}</span>${m.stopped_early ? '<span class="chip stopped">stopped early</span>' : ''}`
+      + (m.threshold != null && m.threshold < 0.1 ? '<span class="chip failed" title="It needs a very low confidence threshold to find objects: train for more epochs">undertrained</span>' : '')
+      + `<span class="grow"></span>`
+      + `<span class="model-meta">${m.epochs_run ?? '?'} epochs · ${imgs}${m.threshold != null ? ` · threshold ${m.threshold}` : ''} · ${m.created ? timeAgo(Date.parse(m.created) / 1000) : ''}</span></div>`
+      + `<div class="model-classes">${classes}</div>`
+      + scoresHtml(m.history, m.best)
+      + `<div class="model-actions"><button class="btn btn-sm btn-outline" data-act="run">${icon('film')} Run on a video…</button>`
+      + `<button class="btn btn-sm btn-quiet" data-act="copy">${icon('terminal')} Copy command</button>`
+      + `<button class="btn btn-sm btn-ghost" data-act="delete" title="Delete the model folder">${icon('trash')} Delete…</button>`
+      + `<span class="grow"></span><span class="job-time mono">${esc(m.path)}</span></div>`;
+    if (T.runFor === m.path) li.append(runForm(m));
+    li.querySelector('[data-act="run"]').addEventListener('click', () => {
+      T.runFor = T.runFor === m.path ? null : m.path;
+      renderModels();
+    });
+    li.querySelector('[data-act="delete"]').addEventListener('click', () => deleteModel(m));
+    li.querySelector('[data-act="copy"]').addEventListener('click', async () => {
+      const video = S.project?.video_path || 'VIDEO';
+      const cmd = `python process_video.py ${shellQuote(video)} --weights ${shellQuote(m.path)}`;
+      try { await navigator.clipboard.writeText(cmd); toast('Command copied'); } catch { toast(cmd); }
+    });
+    ul.append(li);
+  }
+}
+
+async function removeJobs(ids) {
+  for (const id of ids) {
+    try {
+      await api(`/api/jobs/${id}`, { method: 'DELETE' });
+    } catch (err) {
+      if (err.status !== 404) { toast(err.message); break; }
+    }
+    T.jobs = T.jobs.filter((j) => j.id !== id);
+    T.logs.delete(id);
+    T.openLogs.delete(id);
+    if (T.unseen === id) T.unseen = null;
+  }
+  renderJobs();
+  renderJobPill();
+}
+
+async function deleteModel(m) {
+  const ok = confirm(`Delete the model "${m.name}"?\n\nThis deletes ${m.path}: its weights, the frames it was trained on and its logs. It can't be undone. Detections made with it are kept.`);
+  if (!ok) return;
+  try {
+    const r = await api(`/api/models?path=${encodeURIComponent(m.path)}`, { method: 'DELETE' });
+    toast(r.kept.length ? `Deleted the model; kept other files in ${r.deleted}: ${r.kept.join(', ')}` : `Deleted ${r.deleted}`);
+  } catch (err) {
+    toast(err.message);
+    return;
+  }
+  T.models = T.models.filter((x) => x.path !== m.path);
+  if (T.runFor === m.path) T.runFor = null;
+  renderModels();
+  renderJobs();
+}
+
+function shellQuote(s) {
+  return /^[\w@%+=:,./-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`;
+}
+
+function uploadVideo(file, onProgress) {
+  // XMLHttpRequest, not fetch: it reports upload progress.
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', `/api/videos?name=${encodeURIComponent(file.name)}`);
+    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+    xhr.upload.onprogress = (e) => { if (e.lengthComputable) onProgress(e.loaded / e.total); };
+    xhr.onload = () => {
+      let r = null;
+      try { r = JSON.parse(xhr.responseText); } catch { /* not JSON */ }
+      if (xhr.status < 300) resolve(r);
+      else reject(new Error(xhr.status === 404 || xhr.status === 405 ? OUTDATED : r?.detail || xhr.statusText));
+    };
+    xhr.onerror = () => reject(new Error('The upload failed'));
+    xhr.send(file);
+  });
+}
+
+function runForm(model) {
+  // Kept across redraws of the models list.
+  const st = (T.run ??= { video: S.project?.video_path || T.videos[0] || '', open: true });
+  const form = document.createElement('form');
+  form.className = 'run-form';
+  const videos = [...new Set([st.video, ...T.videos].filter(Boolean))];
+  form.innerHTML = `<label>Video<span class="video-pick"><select name="video" required>`
+    + videos.map((v) => `<option value="${esc(v)}">${esc(v)}${v === S.project?.video_path ? '  (open)' : ''}</option>`).join('')
+    + `</select><button type="button" class="btn btn-sm btn-outline" data-act="upload" title="Upload a video from this computer">${icon('upload')} Upload…</button>`
+    + `<input type="file" name="file" accept="video/*,.mp4,.mov,.m4v,.avi,.mkv,.webm" hidden></span></label>`
+    + `<label>Min. confidence<input name="threshold" type="number" min="0" max="1" step="0.01" placeholder="auto"></label>`
+    + `<button class="btn btn-primary" type="submit">${icon('sparkle')} Detect</button>`
+    + `<label class="run-open"><input type="checkbox" name="open"> Open the results in the annotator when done</label>`;
+  form.video.value = st.video;
+  form.open.checked = st.open;
+  form.video.addEventListener('change', () => { st.video = form.video.value; });
+  form.open.addEventListener('change', () => { st.open = form.open.checked; });
+  // The threshold chosen when the model was trained (best F1 on its held-out frames).
+  form.threshold.value = model.threshold ?? '';
+  form.threshold.title = model.threshold != null ? 'Chosen for this model when it was trained (best F1 on the held-out frames)' : '';
+
+  const upBtn = form.querySelector('[data-act="upload"]');
+  upBtn.addEventListener('click', () => form.file.click());
+  form.file.addEventListener('change', async () => {
+    const file = form.file.files[0];
+    if (!file) return;
+    upBtn.disabled = true;
+    form.querySelector('[type="submit"]').disabled = true;
+    try {
+      const r = await uploadVideo(file, (f) => { upBtn.textContent = `Uploading ${Math.round(f * 100)}%`; });
+      T.videos = [...new Set([r.video, ...T.videos])];
+      st.video = r.video;
+      toast(`Uploaded to ${r.video}`);
+    } catch (err) {
+      toast(err.message, 5000);
+    }
+    renderModels();  // redraws this form with the new video selected
+  });
+
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const btn = form.querySelector('[type="submit"]');
+    btn.disabled = true;
+    try {
+      const job = await api('/api/jobs/detect', {
+        method: 'POST',
+        body: {
+          model: model.path,
+          video: form.video.value,
+          threshold: form.threshold.value === '' ? null : Number(form.threshold.value),
+        },
+      });
+      if (st.open) T.openWhenDone.add(job.id);
+      T.jobs = [job, ...T.jobs.filter((j) => j.id !== job.id)];
+      T.runFor = null;
+      renderModels();
+      renderJobs();
+      $('#jobList').scrollIntoView({ block: 'start', behavior: 'smooth' });
+      pollJobs();
+    } catch (err) {
+      toast(err.message);
+      btn.disabled = false;
+    }
+  });
+  return form;
+}
+
+function renderJobPill() {
+  const pill = $('#jobPill');
+  const running = T.jobs.find((j) => j.status === 'running');
+  const ended = !running && T.unseen ? T.jobs.find((j) => j.id === T.unseen) : null;
+  const job = running || ended;
+  pill.hidden = !job;
+  if (!job) return;
+  const phase = jobPhase(job);
+  pill.dataset.state = running ? 'running' : job.status === 'done' ? 'done' : 'failed';
+  const what = job.kind === 'train' ? 'Training' : 'Detecting';
+  pill.querySelector('.job-pill-txt').textContent = running
+    ? `${what}${job.kind === 'train' && job.progress?.epoch ? ` · epoch ${job.progress.epoch}/${job.progress.epochs}` : phase.detail ? ` · ${phase.detail}` : '…'}`
+    : job.status === 'done' ? (job.kind === 'train' ? 'Model ready' : 'Detections ready')
+      : job.status === 'stopped' ? `${what} stopped` : `${what} failed`;
+  pill.querySelector('.job-pill-bar i').style.width = `${((phase.frac ?? 0) * 100).toFixed(1)}%`;
+  pill.title = job.title;
+}
+
+async function pollJobs() {
+  clearTimeout(T.pollTimer);
+  let jobs;
+  try {
+    jobs = (await api('/api/jobs')).jobs;
+  } catch {
+    T.pollTimer = setTimeout(pollJobs, 5000);
+    return;
+  }
+  const before = new Map(T.jobs.map((j) => [j.id, j.status]));
+  T.jobs = jobs;
+  let reloadModels = false;
+  for (const job of jobs) {
+    if (before.get(job.id) === 'running' && job.status !== 'running') {
+      const what = job.kind === 'train' ? 'Training' : 'Detection';
+      toast(`${what} ${job.status === 'done' ? 'finished' : job.status}`);
+      if ($('#trainModal').hidden || T.tab !== 'jobs') T.unseen = job.id;
+      if (job.kind === 'train') reloadModels = true;
+      if (T.openLogs.has(job.id)) loadJobLog(job.id);
+      if (job.status === 'done' && T.openWhenDone.delete(job.id)) {
+        openFiles(job.result.detections, job.result.video);
+        return;
+      }
+    }
+  }
+  if (reloadModels) {
+    try {
+      T.models = (await api('/api/models')).models;
+      renderModels();
+    } catch { /* shown on the next open */ }
+  }
+  for (const id of T.openLogs) if (jobs.find((j) => j.id === id)?.status === 'running') loadJobLog(id);
+  renderJobPill();
+  renderJobs();
+  if (jobs.some((j) => j.status === 'running')) T.pollTimer = setTimeout(pollJobs, 1000);
+}
+
+async function openFiles(detections, video) {
+  try {
+    if (S.project && !stale) await flushSave();
+    await api('/api/open', { method: 'POST', body: { detections, video } });
+    history.replaceState(null, '', '/');
+    location.reload();
+  } catch (err) {
+    toast(err.message);
+  }
+}
+
+function wireTrain() {
+  $('#trainBtn').addEventListener('click', () => openTrain('new'));
+  $('#jobPill').addEventListener('click', () => openTrain('jobs'));
+  $('#trainClose').addEventListener('click', closeTrain);
+  $('#trainCancel').addEventListener('click', closeTrain);
+  $('#trainModal').addEventListener('click', (e) => { if (e.target.id === 'trainModal') closeTrain(); });
+  $('#trainModal').addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') { e.preventDefault(); closeTrain(); }
+  });
+  for (const b of document.querySelectorAll('[data-ttab]')) b.addEventListener('click', () => showTrainTab(b.dataset.ttab));
+  for (const sel of ['#trainFrames', '#trainEvery', '#trainMinScore', '#trainModel', '#trainEpochs', '#trainBatch', '#trainVal', '#trainOutput']) {
+    $(sel).addEventListener('input', updateTrainForm);
+  }
+  $('#trainGo').addEventListener('click', startTraining);
+  $('#clearJobs').addEventListener('click', () => removeJobs(T.jobs.filter((j) => j.status !== 'running').map((j) => j.id)));
+  pollJobs();
+}
+
+// ------------------------------------------------------------------
 // Start
 // ------------------------------------------------------------------
 
 async function init() {
   wireUi();
   wirePicker();
+  wireTrain();
   let p;
   try {
     p = await api('/api/project');
