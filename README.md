@@ -143,8 +143,12 @@ Works with both `--count-mode crossing` and `--count-mode total`.
 Uses [locate-anything.cpp](https://github.com/mudler/locate-anything.cpp)
 (`locate-anything-cli` in PATH, or the shared library, see below). Like the
 cloud detector it runs on sampled frames only (`--sample-rate`, default 1/s)
-and `--classes` is free-form text. Each class becomes part of the prompt
-(`Locate all the instances that matches the following description: apple.`).
+and `--classes` is free-form text. Each class is asked for separately
+(`Locate all the instances that matches the following description: apple.`),
+so a frame takes one call per class. The model also accepts several classes
+in one prompt (`apple</c>box`), but then labels every box with the first
+class (the crates came back as "apple") and repeats boxes until it runs out
+of tokens.
 
     python process_video.py videos/conveyor/upscaled/ttC_MBiNQpWETFACh7yoA_minimax-h3_upscaled.mp4 \
       --detector locate-anything \
@@ -305,6 +309,39 @@ the other tabs stop saving instead of writing into the wrong file.
   image.
 
 Options: `--root`, `--port`, `--host`, `--no-browser`.
+
+### Label Assist: find objects with a model
+
+The wand button in the toolbar (or `I`) runs a detector on the frame you are
+looking at and shows what it found as dashed proposals to review:
+
+- **Cloud**: Claude Sonnet 5.5 (default) or Opus 5.5, like
+  `--detector cloud` (needs `ANTHROPIC_API_KEY` in `.env`). Any class name,
+  each with an optional description ("only the ripe ones") added to the
+  prompt.
+- **Local**: locate-anything (any class name; uses `LOCATE_ANYTHING_MODEL` /
+  `LOCATE_ANYTHING_LIB` from `.env`, or the model recorded in a
+  locate-anything file), or the stock RF-DETR (COCO classes only).
+- **Trained**: an RF-DETR fine-tuned here (see below), with its own classes.
+
+Pick the classes to find (the file's classes are chosen by default; add
+others in the panel), then **Find objects** (`Enter`). Then:
+
+- Click a proposal to leave it out (click again to keep it).
+- For scored models (RF-DETR, cloud), the confidence slider hides weak
+  proposals. It starts at the model's threshold, and moving it doesn't
+  detect again.
+- **Add the new ones** skips proposals that overlap a box of the same class
+  already on the frame. **Replace** removes this frame's boxes of the
+  chosen classes and adds the proposals instead.
+- **Save** applies it as one change (`⌘Z` undoes it). Changing frames
+  discards unsaved proposals; the panel stays open, so you can go to the
+  next frame and press `Enter` again.
+
+Drag the panel by its title to see what's under it (double-click the title
+to put it back). Local models stay loaded in the annotator between runs, so only the first
+run pays for loading them. Nothing runs or is saved until you press the
+buttons.
 
 ## Fine-tune RF-DETR on your detections
 

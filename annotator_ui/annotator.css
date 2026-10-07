@@ -321,6 +321,66 @@ kbd {
 .editor-list .num { border-radius: 5px; border: 1px solid var(--line); background: #fff; min-width: 20px; height: 20px; }
 .editor-list .ring { width: 11px; height: 11px; border-radius: 50%; border: 2px solid #fff; }
 
+/* ---------- Label Assist ---------- */
+.assist {
+  position: absolute; top: 16px; left: 16px; z-index: 9;
+  width: min(350px, calc(100% - 92px)); max-height: calc(100% - 110px);
+  display: flex; flex-direction: column;
+  background: #fff; border: 1px solid var(--accent-line);
+  border-radius: 12px; box-shadow: 0 10px 40px rgba(30, 58, 138, .18);
+  overflow: hidden;
+}
+body.assist-open:not(.assist-moved) .banner { left: 382px; max-width: min(460px, calc(100% - 840px)); }
+.assist-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 10px 10px 10px 16px; background: var(--accent-soft);
+  border-bottom: 1px solid var(--accent-line);
+  color: var(--accent); font-weight: 600; font-size: 15px;
+  cursor: grab; user-select: none; touch-action: none;
+}
+.assist-head.dragging { cursor: grabbing; }
+.assist-head > span { display: inline-flex; align-items: center; gap: 8px; }
+.assist-tabs { margin: 0; padding: 0 12px; }
+.assist-tabs .tab { font-size: 14px; padding: 8px 0; }
+.assist-tabs .tab:disabled { opacity: .4; cursor: default; }
+.assist-body { padding: 12px 16px; display: flex; flex-direction: column; gap: 10px; overflow-y: auto; min-height: 0; }
+.afield { display: flex; flex-direction: column; gap: 5px; font-size: 13px; color: var(--ink-2); font-weight: 500; }
+.afield select, .assist-add input, .assist-descs input {
+  height: 34px; min-width: 0; width: 100%; padding: 0 10px; font-weight: 400;
+  border: 1px solid var(--line); border-radius: 8px; background: #fff; outline: none;
+}
+.afield select:focus, .assist-add input:focus, .assist-descs input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.assist-note { font-size: 12.5px; color: var(--muted); }
+.assist-note.warn { color: #b45309; }
+.assist-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.assist-chips:empty::after { content: "Add the classes to look for below."; color: var(--faint); font-size: 12.5px; font-weight: 400; }
+.achip {
+  display: inline-flex; align-items: center; gap: 6px; height: 28px; padding: 0 10px;
+  border: 1px solid var(--line); border-radius: 999px; background: #fff;
+  font-size: 13px; font-weight: 400; color: var(--muted);
+}
+.achip .sw { width: 9px; height: 9px; border-radius: 3px; opacity: .4; }
+.achip.on { background: var(--accent-soft); border-color: var(--accent-line); color: var(--accent); font-weight: 500; }
+.achip.on .sw { opacity: 1; }
+.achip:disabled { opacity: .45; cursor: default; text-decoration: line-through; }
+.assist-add { display: flex; gap: 6px; }
+.assist-add .btn { height: 34px; flex: none; }
+.assist-descs { display: flex; flex-direction: column; gap: 8px; }
+.assist-descs label { display: flex; flex-direction: column; gap: 4px; font-size: 12.5px; color: var(--ink-2); }
+.assist-summary { font-size: 14px; color: var(--ink); }
+.assist-summary .n { color: var(--muted); }
+.assist-modes { display: flex; flex-direction: column; gap: 6px; font-size: 13px; }
+.assist-modes label { display: flex; align-items: flex-start; gap: 8px; cursor: pointer; }
+.assist-modes input { margin: 2px 0 0; accent-color: var(--accent); }
+.assist .picker-error { margin: 0 16px 8px; }
+.assist-foot {
+  display: flex; align-items: center; gap: 8px; padding: 10px 16px 12px;
+  border-top: 1px solid var(--line);
+}
+.assist-meta { margin-right: auto; font-size: 12px; color: var(--faint); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.assist-foot .btn-primary .ic { width: 15px; height: 15px; }
+#assistGo.busy .ic { animation: pulse 1s infinite; }
+
 /* ---------- Timeline ---------- */
 #timelineWrap {
   display: flex; align-items: center; gap: 10px;

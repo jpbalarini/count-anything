@@ -45,7 +45,10 @@ class CloudDetector:
         class_names: dict[int, str],
         threshold: float,
         max_side: int,
+        descriptions: dict[str, str] | None = None,
     ):
+        """`descriptions`: optional {class name: what it means}, added
+        to the prompt (e.g. "only people wearing a helmet")."""
         import anthropic
 
         self.anthropic = anthropic
@@ -61,6 +64,11 @@ class CloudDetector:
             for class_id, name in class_names.items()
         }
         self.labels = list(class_names.values())
+        self.descriptions = {
+            name: text.strip()
+            for name, text in (descriptions or {}).items()
+            if text and text.strip()
+        }
 
         self.tool = {
             "name": _DETECTIONS_TOOL,
@@ -110,6 +118,7 @@ class CloudDetector:
         self.failures = 0
         self.input_tokens = 0
         self.output_tokens = 0
+        self.last_error: str | None = None  # why the last failed call failed
 
     @staticmethod
     def _empty() -> sv.Detections:
@@ -192,6 +201,13 @@ class CloudDetector:
                 future.add_done_callback(done)
         return {key: f.result() for key, f in futures.items()}
 
+    def _failed(self, reason: str) -> None:
+        with self._lock:
+            self.failures += 1
+            self.last_error = reason
+        print(f"warning: cloud call failed, skipping sample: {reason}")
+        return None
+
     @staticmethod
     def _parse_text_answer(response) -> list:
         text = "".join(
@@ -216,7 +232,11 @@ class CloudDetector:
             f"This image is {img_w}x{img_h} pixels. Detect every "
             "visible instance of these object types: "
             f"{', '.join(self.labels)}.\n"
-            "Give a tight bounding box for each one as "
+            + "".join(
+                f"Only count as {name}: {text}\n"
+                for name, text in self.descriptions.items()
+            )
+            + "Give a tight bounding box for each one as "
             "[x1, y1, x2, y2] in pixel coordinates of this image "
             "(origin top-left). Include partially visible objects, "
             "report each physical object exactly once, and ignore "
@@ -229,9 +249,13 @@ class CloudDetector:
         with self._lock:
             self.calls += 1
         try:
-            response = self.client.messages.create(
+            # Streamed: the SDK refuses a non-streaming request with this
+            # many max_tokens (it could outlast its 10 minute timeout).
+            # Only the final message is used.
+            with self.client.messages.stream(
                 model=self.model,
-                max_tokens=8192,
+                # Room for thinking plus a long list of boxes.
+                max_tokens=32000,
                 tools=[self.tool],
                 # Not {"type": "tool", ...}: forcing a tool is rejected
                 # by some models (400), so ask for it in the prompt.
@@ -252,16 +276,22 @@ class CloudDetector:
                         ],
                     }
                 ],
-            )
+            ) as stream:
+                response = stream.get_final_message()
         except self.anthropic.APIError as exc:
-            with self._lock:
-                self.failures += 1
-            print(f"warning: cloud call failed, skipping sample: {exc}")
-            return None
+            return self._failed(str(exc))
 
         with self._lock:
             self.input_tokens += response.usage.input_tokens
             self.output_tokens += response.usage.output_tokens
+
+        if response.stop_reason == "refusal":
+            details = getattr(response, "stop_details", None)
+            category = getattr(details, "category", None)
+            return self._failed(
+                "the model declined the request"
+                + (f" ({category})" if category else "")
+            )
 
         items = []
         for block in response.content:
@@ -274,6 +304,8 @@ class CloudDetector:
         else:
             # No tool call: accept a JSON answer in plain text.
             items = self._parse_text_answer(response)
+            if not items and response.stop_reason == "max_tokens":
+                return self._failed("the answer was cut off (max_tokens)")
 
         boxes, confs, ids = [], [], []
         for item in items:

@@ -455,10 +455,12 @@ def main() -> None:
             f"locate-anything detector: {args.locate_model} "
             f"({args.locate_mode}, {locate_detector.backend}), "
             f"{effective_rate:g} samples/s (one "
-            f"call every {sample_step:g} frames, ~{expected_calls} "
-            "calls, one at a time)"
+            f"sample every {sample_step:g} frames, ~{expected_calls} "
+            f"samples x {len(locate_detector.prompts)} class(es), one "
+            "call at a time)"
         )
-        print(f"Prompt: {locate_detector.prompt}")
+        for prompt in locate_detector.prompts.values():
+            print(f"Prompt: {prompt}")
 
         print("Running locate-anything detection...")
         with tqdm(

@@ -210,6 +210,8 @@ function markDirty() {
   updateBanner();
   drawTimeline();
   renderSidebar();
+  // Edits change which Label Assist proposals are already boxed.
+  if (A.preview) { renderAssistResult(); updateAssistButtons(); }
   requestDraw();
 }
 
@@ -487,6 +489,7 @@ async function goTo(pos) {
   flushSave();
   closeEditor(true);
   cancelDrag();
+  endPreview();  // proposals belong to the frame they were found on
   S.loaded = false;
   S.pos = pos;
   S.selected = null;
@@ -516,6 +519,7 @@ async function goTo(pos) {
   if (!S.lockView) fitView();
   updateBanner();
   renderSidebar();
+  if (assistOpen()) updateAssistButtons();
   requestDraw();
   try { history.replaceState(null, '', `#f=${index}`); } catch { /* ignore */ }
   pref(`pos:${S.project.detections_path}`, index);
@@ -708,6 +712,8 @@ function draw() {
 
   // Boxes, biggest first so small ones stay on top
   const visible = S.boxes.filter(isVisible).sort((a, b) => area(b.box) - area(a.box));
+  // Label Assist set to replace: the boxes that saving would remove.
+  const replaced = A.preview && A.mode === 'replace' && curIndex() === A.preview.index ? A.preview.classes : null;
   for (const b of visible) {
     const color = colorOf(b.label || S.activeClass || '');
     const a = toScreen(b.box[0], b.box[1]);
@@ -715,7 +721,7 @@ function draw() {
     const isSel = b.id === S.selected;
     const isHover = b.id === S.hover;
     const dim = focus && !isSel && !isHover;
-    ctx.globalAlpha = dim ? (editing ? 0.25 : 0.45) : 1;
+    ctx.globalAlpha = replaced?.has(norm(b.label)) ? 0.2 : dim ? (editing ? 0.25 : 0.45) : 1;
     ctx.fillStyle = hexA(color, isSel ? 0.22 : isHover ? 0.3 : 0.14);
     ctx.fillRect(a.x, a.y, c.x - a.x, c.y - a.y);
     ctx.lineWidth = isSel || isHover ? 2.5 : 2;
@@ -723,6 +729,8 @@ function draw() {
     ctx.strokeRect(a.x, a.y, c.x - a.x, c.y - a.y);
   }
   ctx.globalAlpha = 1;
+
+  drawProposals();
 
   // Labels: all of them (L), or the hovered / selected one
   ctx.font = '600 11px Inter, system-ui, sans-serif';
@@ -853,6 +861,10 @@ function updateHover(sp) {
   else if (h) cursor = CURSORS[h];
   else if (onSel) cursor = 'move';
   else if (top) cursor = 'pointer';
+  // Label Assist proposals take clicks first (to leave them out).
+  const proposal = !spaceDown && !h ? proposalsAt(sp)[0] : null;
+  if ((proposal?.id ?? null) !== A.hover) A.hover = proposal?.id ?? null;
+  if (proposal) { cursor = 'pointer'; overBox = true; }
   canvas.style.cursor = cursor;
   requestDraw();
 }
@@ -879,6 +891,14 @@ canvas.addEventListener('pointerdown', (e) => {
   if (!$('#editor').hidden) closeEditor();
   const sel = selectedBox();
   const h = sel && handleAt(sp, sel);
+  const proposal = !h && proposalsAt(sp)[0];
+  if (proposal) {
+    proposal.off = !proposal.off;
+    renderAssistResult();
+    updateAssistButtons();
+    requestDraw();
+    return;
+  }
   if (h) {
     drag = { mode: 'resize', handle: h, id: sel.id, sp, orig: [...sel.box], before: snapshot(), moved: false };
     return;
@@ -1638,6 +1658,7 @@ window.addEventListener('keydown', (e) => {
     case 'Escape':
       if (!$('#menu').hidden || !$('#lightPop').hidden) { closePopups(); return; }
       if (drag) { cancelDrag(); requestDraw(); return; }
+      if (!sel && assistOpen()) { assistBack(); return; }
       select(null);
       return;
     case 'Tab': {
@@ -1649,7 +1670,10 @@ window.addEventListener('keydown', (e) => {
       select(list[next].id);
       return;
     }
-    case 'Enter': if (sel) { e.preventDefault(); openEditor(sel.id); } return;
+    case 'Enter':
+      if (sel) { e.preventDefault(); openEditor(sel.id); }
+      else if (assistOpen()) { e.preventDefault(); assistPrimary(); }
+      return;
     case '?': $('#keysModal').hidden = false; return;
     case '+': case '=': zoomCenter(1.25); return;
     case '-': case '_': zoomCenter(0.8); return;
@@ -1668,6 +1692,7 @@ window.addEventListener('keydown', (e) => {
     case 'b': setTool('box'); break;
     case 'h': setTool('pan'); break;
     case 'r': fillFromPrevious(); break;
+    case 'i': if (assistOpen()) closeAssist(); else openAssist(); break;
     case 'o': toggle('onion'); break;
     case 'l': toggle('showLabels'); break;
     case 'e': toggle('hideAll'); break;
@@ -2446,6 +2471,565 @@ function wireTrain() {
 }
 
 // ------------------------------------------------------------------
+// Label Assist: propose boxes for this frame with a model (label_assist.py)
+// ------------------------------------------------------------------
+
+const A = {
+  data: null,            // GET /api/assist: {sources, coco}
+  tab: 'cloud',          // cloud | local | trained
+  models: {},            // tab -> chosen model (select value)
+  picked: new Map(),     // class-list key -> Set of norm(class) to find
+  extra: [],             // classes added in the panel that the file doesn't have yet
+  desc: {},              // source -> {norm(class): description}
+  mode: 'add',           // add | replace
+  running: null,         // {ctrl, t0, timer, index}
+  preview: null,         // proposals for one frame, see showPreview()
+  hover: null,           // id of the hovered proposal
+};
+
+const assistOpen = () => !$('#assist').hidden;
+
+async function openAssist() {
+  if (!S.project) return;
+  closePopups();
+  closeEditor();
+  $('#assist').hidden = false;
+  document.body.classList.add('assist-open');
+  A.pos ??= pref('assistPos');
+  if (A.pos) placeAssist(A.pos.x, A.pos.y);
+  $('#toolAssist').classList.add('active');
+  if (!A.data) $('#assistNote').textContent = 'Loading…';
+  try {
+    A.data = await api(`/api/assist?${sq()}`);
+  } catch (err) {
+    if (!A.data) { showAssistError(`Could not load the models: ${err.message}`); return; }
+  }
+  if (!A.loaded) {
+    const p = pref('assist') || {};
+    A.models = p.models || {};
+    A.mode = p.mode === 'replace' ? 'replace' : 'add';
+    A.desc = pref(`assistDesc:${S.project.detections_path}`) || {};
+    const src = A.data.sources;
+    const usable = { cloud: src.cloud.available, local: src.locate.available || src.rfdetr.available, trained: src.trained.available };
+    A.tab = usable[p.tab] ? p.tab : ['cloud', 'local', 'trained'].find((t) => usable[t]) || 'cloud';
+    A.loaded = true;
+  }
+  renderAssist();
+}
+
+function closeAssist() {
+  cancelAssistRun();
+  endPreview();
+  $('#assist').hidden = true;
+  document.body.classList.remove('assist-open');
+  $('#toolAssist').classList.remove('active');
+  if (document.activeElement?.closest('#assist')) document.activeElement.blur();
+}
+
+function saveAssistPrefs() {
+  pref('assist', { tab: A.tab, models: A.models, mode: A.mode });
+  if (S.project) pref(`assistDesc:${S.project.detections_path}`, A.desc);
+}
+
+// What the panel's tab and model select point at.
+function assistTarget() {
+  const src = A.data.sources;
+  const v = $('#assistModel').value;
+  if (A.tab === 'cloud') return { source: 'cloud', model: v, kind: 'free', info: src.cloud };
+  if (A.tab === 'trained') {
+    const m = src.trained.models.find((x) => x.path === v);
+    return { source: 'trained', model: v, kind: 'trained', info: src.trained, trained: m };
+  }
+  if (v === 'locate') return { source: 'locate', model: null, kind: 'free', info: src.locate };
+  return { source: 'rfdetr', model: v.replace(/^rfdetr:/, ''), kind: 'coco', info: src.rfdetr };
+}
+
+const cocoSet = () => new Set((A.data?.coco || []).map(norm));
+
+// The classes offered as chips: [{name, disabled?}].
+function assistCandidates(t) {
+  if (t.kind === 'trained') return (t.trained?.classes || []).map((name) => ({ name }));
+  const seen = new Set();
+  const out = [];
+  const coco = t.kind === 'coco' ? cocoSet() : null;
+  for (const name of [...S.classes, ...A.extra]) {
+    if (seen.has(norm(name))) continue;
+    seen.add(norm(name));
+    const notCoco = coco && !coco.has(norm(name));
+    // Classes added in the panel that RF-DETR doesn't know aren't offered.
+    if (notCoco && !S.classes.includes(name)) continue;
+    out.push({ name, disabled: notCoco });
+  }
+  return out;
+}
+
+function pickedSet(t) {
+  const key = t.kind === 'trained' ? `trained:${t.model}` : t.kind;
+  if (!A.picked.has(key)) {
+    // Default: everything the file (or the model) has.
+    A.picked.set(key, new Set(assistCandidates(t).filter((c) => !c.disabled).map((c) => norm(c.name))));
+  }
+  return A.picked.get(key);
+}
+
+function assistClasses(t) {
+  const picked = pickedSet(t);
+  return assistCandidates(t).filter((c) => !c.disabled && picked.has(norm(c.name))).map((c) => c.name);
+}
+
+function renderAssist() {
+  if (!A.data) return;
+  for (const b of document.querySelectorAll('[data-asrc]')) b.classList.toggle('active', b.dataset.asrc === A.tab);
+  const preview = Boolean(A.preview);
+  $('#assistForm').hidden = preview;
+  $('#assistResult').hidden = !preview;
+  if (preview) renderAssistResult();
+  else renderAssistForm();
+  updateAssistButtons();
+}
+
+function renderAssistForm() {
+  const src = A.data.sources;
+  const sel = $('#assistModel');
+  let options;
+  if (A.tab === 'cloud') {
+    options = src.cloud.models.map((m) => [m.id, m.name]);
+  } else if (A.tab === 'local') {
+    options = [['locate', `locate-anything — any class${src.locate.available ? '' : ' (not set up)'}`]];
+    for (const size of src.rfdetr.sizes) options.push([`rfdetr:${size}`, `RF-DETR ${size} — COCO classes`]);
+  } else {
+    options = src.trained.models.map((m) => [m.path, `${m.name} — ${m.classes.join(', ')}`]);
+  }
+  sel.innerHTML = options.map(([v, label]) => `<option value="${esc(v)}">${esc(label)}</option>`).join('');
+  sel.disabled = !options.length;
+  const fallback = A.tab === 'cloud' ? src.cloud.default
+    : A.tab === 'local' ? (src.locate.available ? 'locate' : `rfdetr:${src.rfdetr.default}`)
+      : options[0]?.[0];
+  const want = A.models[A.tab];
+  sel.value = options.some(([v]) => v === want) ? want : fallback ?? '';
+
+  const t = assistTarget();
+  const note = $('#assistNote');
+  let text;
+  let warn = false;
+  if (!t.info.available) {
+    text = t.info.reason;
+    warn = true;
+  } else if (t.source === 'cloud') {
+    text = 'Sends this frame to the Anthropic API (uses API credits). Takes a few seconds.';
+  } else if (t.source === 'locate') {
+    text = `Runs ${t.info.model} on this computer, a few seconds per frame`
+      + (t.info.resident ? '; the first run loads the model.' : ' (the CLI reloads the model every time).');
+  } else if (t.source === 'rfdetr') {
+    text = `Runs on this computer; only the 80 COCO classes.${t.info.loaded.includes(t.model) ? '' : ' The first run loads the model.'}`;
+  } else {
+    text = `Fine-tuned on: ${t.trained?.classes.join(', ') || '?'}.`;
+  }
+  note.textContent = text;
+  note.classList.toggle('warn', warn);
+
+  const picked = pickedSet(t);
+  const chips = $('#assistChips');
+  chips.innerHTML = '';
+  for (const c of assistCandidates(t)) {
+    const on = !c.disabled && picked.has(norm(c.name));
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = `achip${on ? ' on' : ''}`;
+    b.disabled = Boolean(c.disabled);
+    b.title = c.disabled ? 'Not a COCO class: RF-DETR can\'t find it' : on ? 'Click to leave out' : 'Click to find it too';
+    b.innerHTML = `<span class="sw" style="background:${colorOf(c.name)}"></span>${esc(c.name)}`;
+    b.addEventListener('click', () => {
+      if (picked.has(norm(c.name))) picked.delete(norm(c.name)); else picked.add(norm(c.name));
+      renderAssistForm();
+      updateAssistButtons();
+    });
+    chips.append(b);
+  }
+
+  $('#assistAddForm').hidden = t.kind === 'trained';
+  $('#assistAddInput').placeholder = t.kind === 'coco' ? 'Add a COCO class to find…' : 'Add a class to find…';
+  $('#assistAddList').innerHTML = t.kind === 'coco' ? A.data.coco.map((c) => `<option value="${esc(c)}">`).join('') : '';
+
+  // Descriptions: only the cloud model reads more than the class names.
+  const descs = $('#assistDescs');
+  descs.innerHTML = '';
+  if (t.source === 'cloud') {
+    const mine = (A.desc[t.source] ??= {});
+    for (const name of assistClasses(t)) {
+      const label = document.createElement('label');
+      const hint = `Describe ${name} (optional), e.g. only the ripe ones`;
+      label.innerHTML = `<span>${esc(name)}</span><input spellcheck="false" placeholder="${esc(hint)}">`;
+      const input = label.querySelector('input');
+      input.value = mine[norm(name)] || '';
+      input.addEventListener('input', () => {
+        if (input.value.trim()) mine[norm(name)] = input.value; else delete mine[norm(name)];
+        saveAssistPrefs();
+      });
+      descs.append(label);
+    }
+  }
+}
+
+function addAssistClass(raw) {
+  const t = assistTarget();
+  let name = raw.trim();
+  if (!name) return;
+  if (t.kind === 'coco') {
+    const hit = A.data.coco.find((c) => norm(c) === norm(name));
+    if (!hit) { showAssistError(`“${name}” is not a COCO class; RF-DETR only knows those. Use the Cloud tab or locate-anything for other things.`); return; }
+    name = hit;
+  }
+  const known = [...S.classes, ...A.extra].find((c) => norm(c) === norm(name));
+  if (!known) A.extra.push(name);
+  pickedSet(t).add(norm(known || name));
+  $('#assistAddInput').value = '';
+  $('#assistError').hidden = true;
+  renderAssistForm();
+  updateAssistButtons();
+}
+
+function updateAssistButtons() {
+  const go = $('#assistGo');
+  const back = $('#assistBack');
+  go.classList.toggle('busy', Boolean(A.running));
+  if (A.running) {
+    const s = Math.round((performance.now() - A.running.t0) / 1000);
+    go.innerHTML = `${icon('wand')} Finding… ${s} s`;
+    go.disabled = true;
+    back.textContent = 'Cancel';
+    return;
+  }
+  if (A.preview) {
+    const st = previewState();
+    go.innerHTML = `${icon('check')} Save (${st.add.length})`;
+    go.disabled = !st.add.length && !st.removed.length;
+    back.textContent = 'Back';
+    return;
+  }
+  go.innerHTML = `${icon('wand')} Find objects`;
+  const t = A.data && assistTarget();
+  go.disabled = !t || !t.info.available || !assistClasses(t).length || !S.loaded;
+  back.textContent = 'Close';
+}
+
+function showAssistError(msg) {
+  const el = $('#assistError');
+  el.textContent = msg;
+  el.hidden = !msg;
+}
+
+async function runAssist() {
+  if (!A.data || A.running || !S.loaded) return;
+  const t = assistTarget();
+  const names = assistClasses(t);
+  if (!t.info.available || !names.length) return;
+  const mine = A.desc[t.source] || {};
+  const body = {
+    source: t.source,
+    model: t.model,
+    classes: names.map((name) => ({ name, description: t.source === 'cloud' ? (mine[norm(name)] || '').trim() : '' })),
+  };
+  const index = curIndex();
+  const ctrl = new AbortController();
+  A.running = { ctrl, index, t0: performance.now(), timer: setInterval(updateAssistButtons, 500) };
+  showAssistError('');
+  $('#assistMeta').textContent = '';
+  updateAssistButtons();
+  let r;
+  try {
+    r = await api(`/api/assist/${index}?${sq()}`, { method: 'POST', body, signal: ctrl.signal });
+  } catch (err) {
+    if (err.name !== 'AbortError') showAssistError(err.message);
+    return;
+  } finally {
+    clearInterval(A.running?.timer);
+    A.running = null;
+    updateAssistButtons();
+  }
+  if (!assistOpen()) return;
+  if (curIndex() !== index || !S.loaded) {
+    toast(`Label Assist results were for frame #${index}; run it again on this one`);
+    return;
+  }
+  showPreview(r, names);
+}
+
+function cancelAssistRun() {
+  if (!A.running) return;
+  A.running.ctrl.abort();
+  clearInterval(A.running.timer);
+  A.running = null;
+  updateAssistButtons();
+}
+
+function showPreview(r, names) {
+  const scored = r.boxes.some((b) => b.confidence < 1);
+  A.preview = {
+    index: r.index,
+    boxes: r.boxes.map((b) => ({ ...b, id: nextId++, off: false })),
+    classes: new Set(names.map(norm)),
+    names,
+    scored,
+    minConf: scored ? (r.threshold ?? 0) : 0,
+  };
+  const usage = r.usage ? ` · ${r.usage.input_tokens.toLocaleString()} in / ${r.usage.output_tokens.toLocaleString()} out tokens` : '';
+  $('#assistMeta').textContent = `${r.model} · ${r.seconds} s`;
+  $('#assistMeta').title = `${r.model} · ${r.seconds} s${usage}`;
+  $('#assistConf').value = A.preview.minConf;
+  for (const radio of document.querySelectorAll('[name="assistMode"]')) radio.checked = radio.value === A.mode;
+  renderAssist();
+  requestDraw();
+}
+
+function endPreview() {
+  if (!A.preview) return;
+  A.preview = null;
+  A.hover = null;
+  $('#assistMeta').textContent = '';
+  if (assistOpen()) renderAssist();
+  requestDraw();
+}
+
+// What saving would do: proposals to add, ones already boxed here
+// (skipped when adding), existing boxes replaced.
+function previewState() {
+  const p = A.preview;
+  const out = { add: [], dup: [], off: [], low: [], removed: [] };
+  if (!p) return out;
+  const replace = A.mode === 'replace';
+  const kept = replace ? S.boxes.filter((b) => b.label && !p.classes.has(norm(b.label))) : S.boxes;
+  if (replace) out.removed = S.boxes.filter((b) => b.label && p.classes.has(norm(b.label)));
+  for (const b of p.boxes) {
+    if (b.confidence < p.minConf) out.low.push(b);
+    else if (b.off) out.off.push(b);
+    else if (!replace && kept.some((x) => norm(x.label) === norm(b.label) && iou(x.box, b.box) >= FILL_IOU)) out.dup.push(b);
+    else out.add.push(b);
+  }
+  return out;
+}
+
+const plural = (n, word) => `${n} ${word}${n === 1 ? '' : (/(s|x|ch|sh)$/.test(word) ? 'es' : 's')}`;
+
+function renderAssistResult() {
+  const p = A.preview;
+  const st = previewState();
+  const shown = p.boxes.filter((b) => b.confidence >= p.minConf);
+  const counts = new Map();
+  for (const b of shown) counts.set(b.label, (counts.get(b.label) || 0) + 1);
+  const per = [...counts].map(([name, n]) => `${n} ${esc(name)}`).join(', ');
+  $('#assistSummary').innerHTML = shown.length
+    ? `Found ${plural(shown.length, 'object')}<span class="n">: ${per}</span>`
+      + (st.off.length ? ` <span class="n">· ${st.off.length} left out</span>` : '')
+    : `Nothing found for ${esc(p.names.join(', '))}${p.boxes.length ? ' above this confidence' : ''}.`;
+  $('#assistConfRow').hidden = !p.scored;
+  $('#assistConfValue').textContent = p.minConf.toFixed(2);
+  const which = p.names.length > 2 ? `boxes of these ${p.names.length} classes` : `${p.names.map((n) => `“${n}”`).join(' and ')} boxes`;
+  $('#assistModeAdd').textContent = `Add the new ones (${st.add.length} new${A.mode === 'add' && st.dup.length ? `, ${st.dup.length} already boxed here` : ''})`;
+  const removing = S.boxes.filter((b) => b.label && p.classes.has(norm(b.label))).length;
+  $('#assistModeReplace').textContent = `Replace this frame's ${which} (removes ${removing})`;
+}
+
+function saveAssist() {
+  const p = A.preview;
+  if (!p || !S.loaded || curIndex() !== p.index) return;
+  const st = previewState();
+  if (!st.add.length && !st.removed.length) return;
+  const before = snapshot();
+  if (A.mode === 'replace') S.boxes = S.boxes.filter((b) => !st.removed.includes(b));
+  const added = st.add.map((b) => withId({ label: ensureClass(b.label, false), confidence: b.confidence, box: b.box }));
+  S.boxes.push(...added);
+  S.selected = null;
+  commit(before);
+  toast(A.mode === 'replace'
+    ? `Replaced ${plural(st.removed.length, 'box')} with ${st.add.length} (⌘Z to undo)`
+    : `Added ${plural(added.length, 'box')} (⌘Z to undo)`);
+  endPreview();
+}
+
+// Primary action (button / Enter): find, or save the proposals.
+function assistPrimary() {
+  if (A.running) return;
+  if (A.preview) saveAssist(); else runAssist();
+}
+
+function assistBack() {
+  if (A.running) cancelAssistRun();
+  else if (A.preview) endPreview();
+  else closeAssist();
+}
+
+// Proposals under a screen point that can be clicked, smallest first.
+function proposalsAt(sp) {
+  const p = A.preview;
+  if (!p) return [];
+  const pt = toImg(sp);
+  const pad = HIT_PAD / S.view.scale;
+  return p.boxes
+    .filter((b) => b.confidence >= p.minConf
+      && pt.x >= b.box[0] - pad && pt.x <= b.box[2] + pad
+      && pt.y >= b.box[1] - pad && pt.y <= b.box[3] + pad)
+    .sort((a, b) => area(a.box) - area(b.box));
+}
+
+function drawProposals() {
+  const p = A.preview;
+  if (!p || curIndex() !== p.index) return;
+  const st = previewState();
+  const status = new Map();
+  for (const key of ['add', 'dup', 'off']) for (const b of st[key]) status.set(b.id, key);
+  ctx.save();
+  for (const b of p.boxes) {
+    const s = status.get(b.id);
+    if (!s) continue;
+    const color = colorOf(b.label);
+    const a = toScreen(b.box[0], b.box[1]);
+    const c = toScreen(b.box[2], b.box[3]);
+    const hover = b.id === A.hover;
+    ctx.setLineDash(s === 'add' ? [7, 4] : [3, 4]);
+    if (s === 'add') {
+      ctx.fillStyle = hexA(color, hover ? 0.3 : 0.16);
+      ctx.fillRect(a.x, a.y, c.x - a.x, c.y - a.y);
+      ctx.strokeStyle = color;
+      ctx.lineWidth = hover ? 3 : 2;
+    } else {
+      ctx.strokeStyle = s === 'dup' ? 'rgba(255,255,255,.85)' : 'rgba(225,29,72,.8)';
+      ctx.lineWidth = hover ? 2.5 : 1.5;
+    }
+    ctx.strokeRect(a.x, a.y, c.x - a.x, c.y - a.y);
+    if (s === 'off') {
+      ctx.setLineDash([]);
+      ctx.beginPath();
+      ctx.moveTo(a.x, a.y); ctx.lineTo(c.x, c.y);
+      ctx.moveTo(c.x, a.y); ctx.lineTo(a.x, c.y);
+      ctx.stroke();
+    }
+  }
+  ctx.setLineDash([]);
+  // Label of the hovered proposal (or all of them with L).
+  ctx.font = '600 11px Inter, system-ui, sans-serif';
+  ctx.textBaseline = 'middle';
+  for (const b of p.boxes) {
+    const s = status.get(b.id);
+    if (!s || !(b.id === A.hover || (S.showLabels && s === 'add'))) continue;
+    const color = s === 'add' ? colorOf(b.label) : '#374151';
+    const a = toScreen(b.box[0], b.box[1]);
+    const note = { add: '', dup: ' · already boxed', off: ' · left out' }[s];
+    const text = `${b.label}${b.confidence < 1 ? ` ${b.confidence.toFixed(2)}` : ''}${note}`;
+    const w = ctx.measureText(text).width + 10;
+    const y = a.y >= 18 ? a.y - 18 : a.y;
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.roundRect(a.x - 1, y, w, 18, a.y >= 18 ? [4, 4, 4, 0] : [0, 0, 4, 4]);
+    ctx.fill();
+    ctx.fillStyle = textColor(color);
+    ctx.fillText(text, a.x + 4, y + 9.5);
+  }
+  ctx.restore();
+}
+
+// Move the panel (drag its header). It stays inside the stage and gets
+// shorter (its content scrolls) so the buttons stay visible.
+const ASSIST_MIN_HEIGHT = 230;
+function placeAssist(x, y) {
+  const el = $('#assist');
+  const r = stage.getBoundingClientRect();
+  x = clamp(x, 0, Math.max(0, r.width - el.offsetWidth));
+  y = clamp(y, 0, Math.max(0, r.height - ASSIST_MIN_HEIGHT));
+  el.style.left = `${x}px`;
+  el.style.top = `${y}px`;
+  el.style.maxHeight = `${Math.max(ASSIST_MIN_HEIGHT, r.height - y - 12)}px`;
+  document.body.classList.add('assist-moved');
+  return { x, y };
+}
+
+function resetAssistPlace() {
+  const el = $('#assist');
+  el.style.left = '';
+  el.style.top = '';
+  el.style.maxHeight = '';
+  document.body.classList.remove('assist-moved');
+  A.pos = null;
+  pref('assistPos', null);
+}
+
+function wireAssistDrag() {
+  const head = $('#assist .assist-head');
+  head.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0 || e.target.closest('button')) return;
+    e.preventDefault();
+    const el = $('#assist');
+    const start = { x: e.clientX, y: e.clientY, left: el.offsetLeft, top: el.offsetTop };
+    head.setPointerCapture(e.pointerId);
+    head.classList.add('dragging');
+    const move = (ev) => { A.pos = placeAssist(start.left + ev.clientX - start.x, start.top + ev.clientY - start.y); };
+    const up = () => {
+      head.removeEventListener('pointermove', move);
+      head.removeEventListener('pointerup', up);
+      head.removeEventListener('pointercancel', up);
+      head.classList.remove('dragging');
+      if (A.pos) pref('assistPos', A.pos);
+    };
+    head.addEventListener('pointermove', move);
+    head.addEventListener('pointerup', up);
+    head.addEventListener('pointercancel', up);
+  });
+  head.addEventListener('dblclick', (e) => { if (!e.target.closest('button')) resetAssistPlace(); });
+  // Keep it reachable when the window (or a side panel) shrinks the stage.
+  new ResizeObserver(() => { if (assistOpen() && A.pos) placeAssist(A.pos.x, A.pos.y); }).observe(stage);
+}
+
+function wireAssist() {
+  wireAssistDrag();
+  $('#toolAssist').addEventListener('click', () => (assistOpen() ? closeAssist() : openAssist()));
+  $('#assistClose').addEventListener('click', closeAssist);
+  $('#assistBack').addEventListener('click', assistBack);
+  $('#assistGo').addEventListener('click', assistPrimary);
+  for (const b of document.querySelectorAll('[data-asrc]')) {
+    b.addEventListener('click', () => {
+      if (A.running) return;
+      endPreview();
+      A.tab = b.dataset.asrc;
+      showAssistError('');
+      saveAssistPrefs();
+      renderAssist();
+    });
+  }
+  $('#assistModel').addEventListener('change', (e) => {
+    A.models[A.tab] = e.target.value;
+    saveAssistPrefs();
+    showAssistError('');
+    renderAssistForm();
+    updateAssistButtons();
+    e.target.blur();
+  });
+  $('#assistAddForm').addEventListener('submit', (e) => { e.preventDefault(); addAssistClass($('#assistAddInput').value); });
+  $('#assistConf').addEventListener('input', (e) => {
+    if (!A.preview) return;
+    A.preview.minConf = Number(e.target.value);
+    renderAssistResult();
+    updateAssistButtons();
+    requestDraw();
+  });
+  for (const radio of document.querySelectorAll('[name="assistMode"]')) {
+    radio.addEventListener('change', () => {
+      A.mode = radio.value;
+      saveAssistPrefs();
+      renderAssistResult();
+      updateAssistButtons();
+      requestDraw();
+    });
+  }
+  $('#assist').addEventListener('keydown', (e) => {
+    if (!e.target.closest('input, select')) return;
+    if (e.key === 'Escape') { e.preventDefault(); e.target.blur(); }
+    else if (e.key === 'Enter' && e.target.id !== 'assistAddInput') { e.preventDefault(); e.target.blur(); assistPrimary(); }
+  });
+  // The panel sits over the canvas: don't let clicks reach it.
+  $('#assist').addEventListener('pointerdown', (e) => e.stopPropagation());
+}
+
+// ------------------------------------------------------------------
 // Start
 // ------------------------------------------------------------------
 
@@ -2453,10 +3037,12 @@ async function init() {
   wireUi();
   wirePicker();
   wireTrain();
+  wireAssist();
   let p;
   try {
     p = await api('/api/project');
   } catch (err) {
+    $('#toolAssist').disabled = true;
     if (err.status === 409) {
       // Nothing open yet: choose the files first.
       $('#fileName').textContent = 'No files open';

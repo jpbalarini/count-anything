@@ -2,18 +2,26 @@
 
 Wraps locate-anything.cpp (https://github.com/mudler/locate-anything.cpp),
 an open-vocabulary detector (NVIDIA LocateAnything-3B on ggml). Like the
-cloud detector it is meant to run on sampled frames. Two ways to run it:
+cloud detector it is meant to run on sampled frames.
+
+Each class is asked for separately ("...description: apple."), so a frame
+takes one model call per class. The model accepts several classes in one
+prompt (`apple</c>box`), but then only writes the first one as a label
+and gives it every box (the crates came back as "apple"), and tends to
+repeat boxes until it runs out of tokens.
+
+Two ways to run it:
 
 * Resident engine (`lib_path`): a child process (locate_anything_worker.py)
-  loads liblocate_anything once and answers one request per frame, so the
-  model is not reloaded every time. If it crashes (e.g. a Metal fault)
-  that frame is skipped and a new worker is started.
+  loads liblocate_anything once and answers one request (prompt + frame)
+  at a time, so the model is not reloaded every time. If it crashes (e.g.
+  a Metal fault) that frame is skipped and a new worker is started.
 * `locate-anything-cli` (fallback, no library needed): every frame is
-  written to a temporary JPEG and the CLI is run on it
+  written to a temporary JPEG and the CLI is run on it, once per class
 
       locate-anything-cli detect --model M --input frame.jpg \\
           --prompt "Locate all the instances that matches the following \\
-description: a</c>b." --output boxes.json
+description: apple." --output boxes.json
 
   which loads the model on every call.
 
@@ -45,28 +53,26 @@ DEFAULT_LOCATE_SAMPLE_RATE = 1.0
 PROMPT_PREFIX = (
     "Locate all the instances that matches the following description: "
 )
-CATEGORY_SEPARATOR = "</c>"
 
 
-def _normalize(name: str) -> str:
-    return (
-        name.strip().strip(".").lower().replace("_", " ").replace("-", " ")
-    )
+def class_prompt(name: str) -> str:
+    return f"{PROMPT_PREFIX}{name.strip()}."
+
+
+def _message(data: bytes) -> bytes:
+    return struct.pack("<I", len(data)) + data
 
 
 class _Worker:
     """A locate_anything_worker.py child process holding the model."""
 
-    def __init__(
-        self, lib_path: str, model_path: str, threads: int, mode: str,
-        prompt: str,
-    ):
+    def __init__(self, lib_path: str, model_path: str, threads: int, mode: str):
         # ggml is chatty on stderr; keep it to report why the worker died.
         self._stderr = tempfile.TemporaryFile()
         self.proc = subprocess.Popen(
             [
                 sys.executable, str(WORKER_SCRIPT),
-                lib_path, model_path, str(threads), mode, prompt,
+                lib_path, model_path, str(threads), mode,
             ],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -107,10 +113,10 @@ class _Worker:
             raise RuntimeError(body.decode(errors="replace"))
         return body
 
-    def locate(self, image: bytes) -> list[dict]:
+    def locate(self, prompt: str, image: bytes) -> list[dict]:
         """Run detection on an encoded image; returns the raw detections."""
         try:
-            self.proc.stdin.write(struct.pack("<I", len(image)) + image)
+            self.proc.stdin.write(_message(prompt.encode()) + _message(image))
             self.proc.stdin.flush()
         except OSError:  # broken pipe: the worker died
             pass  # _read() below reports why
@@ -164,19 +170,14 @@ class LocateAnythingDetector:
                 "the model on every frame (see the README to load it once)"
             )
 
-        self.name_to_id = {
-            _normalize(name): class_id
-            for class_id, name in class_names.items()
+        # One prompt per class (see the module docstring).
+        self.prompts = {
+            class_id: class_prompt(name) for class_id, name in class_names.items()
         }
-        self.prompt = (
-            PROMPT_PREFIX
-            + CATEGORY_SEPARATOR.join(class_names.values())
-            + "."
-        )
 
-        self.calls = 0
+        self.calls = 0  # frames
         self.failures = 0
-        self._warned_labels: set[str] = set()
+        self.last_error: str | None = None  # why the last failed call failed
 
         if self.lib_path is not None:
             # Started now so a bad library / model is a startup error
@@ -191,8 +192,7 @@ class LocateAnythingDetector:
 
     def _start_worker(self) -> None:
         self.worker = _Worker(
-            self.lib_path, self.model_path, self.threads, self.mode,
-            self.prompt,
+            self.lib_path, self.model_path, self.threads, self.mode
         )
 
     def close(self) -> None:
@@ -209,82 +209,69 @@ class LocateAnythingDetector:
             class_id=np.empty(0, dtype=int),
         )
 
-    def _class_id(self, label: str) -> int | None:
-        """Map the label the model wrote back to one of our classes."""
-        key = _normalize(label)
-        if key in self.name_to_id:
-            return self.name_to_id[key]
-        # Tolerate the model pluralizing / singularizing.
-        for name, class_id in self.name_to_id.items():
-            if name.rstrip("s") == key.rstrip("s"):
-                return class_id
-        if len(self.name_to_id) == 1:
-            return next(iter(self.name_to_id.values()))
-        if key not in self._warned_labels:
-            self._warned_labels.add(key)
-            print(
-                f"warning: locate-anything returned unknown label "
-                f"'{label}', ignoring those boxes"
-            )
-        return None
-
-    def _locate_anything_worker(self, frame_bgr: np.ndarray) -> list[dict]:
-        """Raw detections from the resident worker (starting it if needed)."""
+    def _locate_anything_worker(self, jpeg: bytes) -> dict[int, list[dict]]:
+        """Raw detections per class from the resident worker (starting it
+        if needed)."""
         if self.worker is None or not self.worker.alive():
             if self.worker is not None:
                 self.worker.close()
             print("note: (re)starting the locate-anything worker")
             self._start_worker()
-        ok, jpeg = cv2.imencode(
-            ".jpg", frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, 95]
-        )
-        if not ok:
-            raise RuntimeError("could not encode the frame")
-        return self.worker.locate(jpeg.tobytes())
+        return {
+            class_id: self.worker.locate(prompt, jpeg)
+            for class_id, prompt in self.prompts.items()
+        }
 
-    def _locate_cli(self, frame_bgr: np.ndarray) -> list[dict]:
-        """Raw detections from one `locate-anything-cli detect` call."""
+    def _locate_cli(self, jpeg: bytes) -> dict[int, list[dict]]:
+        """Raw detections per class, one `locate-anything-cli detect`
+        call each."""
+        found = {}
         with tempfile.TemporaryDirectory(prefix="locate_") as tmp:
             image_path = Path(tmp) / "frame.jpg"
             out_path = Path(tmp) / "boxes.json"
-            cv2.imwrite(
-                str(image_path),
-                frame_bgr,
-                [cv2.IMWRITE_JPEG_QUALITY, 95],
-            )
-
-            cmd = [
-                self.cli,
-                "detect",
-                "--model", self.model_path,
-                "--input", str(image_path),
-                "--prompt", self.prompt,
-                "--output", str(out_path),
-                "--mode", self.mode,
-                "--threads", str(self.threads),
-            ]
-            proc = subprocess.run(cmd, capture_output=True, text=True)
-            if proc.returncode != 0:
-                raise RuntimeError(
-                    proc.stderr.strip().splitlines()[-1]
-                    if proc.stderr.strip()
-                    else f"exit code {proc.returncode}"
-                )
-            return json.loads(out_path.read_text())["detections"]
+            image_path.write_bytes(jpeg)
+            for class_id, prompt in self.prompts.items():
+                cmd = [
+                    self.cli,
+                    "detect",
+                    "--model", self.model_path,
+                    "--input", str(image_path),
+                    "--prompt", prompt,
+                    "--output", str(out_path),
+                    "--mode", self.mode,
+                    "--threads", str(self.threads),
+                ]
+                proc = subprocess.run(cmd, capture_output=True, text=True)
+                if proc.returncode != 0:
+                    raise RuntimeError(
+                        proc.stderr.strip().splitlines()[-1]
+                        if proc.stderr.strip()
+                        else f"exit code {proc.returncode}"
+                    )
+                found[class_id] = json.loads(out_path.read_text())["detections"]
+        return found
 
     def detect(self, frame_bgr: np.ndarray) -> sv.Detections | None:
-        """Return detections, or None if the detection call failed."""
+        """Return detections, or None if a detection call failed (a
+        frame with some classes missing would look like a frame without
+        them)."""
         height, width = frame_bgr.shape[:2]
         self.calls += 1
 
         try:
-            items = (
-                self._locate_anything_worker(frame_bgr)
+            ok, jpeg = cv2.imencode(
+                ".jpg", frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, 95]
+            )
+            if not ok:
+                raise RuntimeError("could not encode the frame")
+            found = (
+                self._locate_anything_worker(jpeg.tobytes())
                 if self.lib_path
-                else self._locate_cli(frame_bgr)
+                else self._locate_cli(jpeg.tobytes())
             )
         except (RuntimeError, OSError, ValueError, KeyError) as exc:
             self.failures += 1
+            self.last_error = str(exc)
             print(
                 f"warning: locate-anything ({self.backend}) failed, "
                 f"skipping sample: {exc}"
@@ -292,20 +279,22 @@ class LocateAnythingDetector:
             return None
 
         boxes, ids = [], []
-        for item in items:
-            try:
-                class_id = self._class_id(item["label"])
-                x1, y1, x2, y2 = (float(v) for v in item["box"])
-            except (KeyError, TypeError, ValueError):
-                continue
-            if class_id is None:
-                continue
-            x1, x2 = sorted((min(max(x1, 0), width), min(max(x2, 0), width)))
-            y1, y2 = sorted((min(max(y1, 0), height), min(max(y2, 0), height)))
-            if x2 - x1 < 1 or y2 - y1 < 1:
-                continue
-            boxes.append([x1, y1, x2, y2])
-            ids.append(class_id)
+        for class_id, items in found.items():
+            seen = set()
+            for item in items:
+                try:
+                    x1, y1, x2, y2 = (float(v) for v in item["box"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                x1, x2 = sorted((min(max(x1, 0), width), min(max(x2, 0), width)))
+                y1, y2 = sorted((min(max(y1, 0), height), min(max(y2, 0), height)))
+                # The model sometimes repeats a box word for word.
+                key = (round(x1), round(y1), round(x2), round(y2))
+                if x2 - x1 < 1 or y2 - y1 < 1 or key in seen:
+                    continue
+                seen.add(key)
+                boxes.append([x1, y1, x2, y2])
+                ids.append(class_id)
 
         if not boxes:
             return self._empty()

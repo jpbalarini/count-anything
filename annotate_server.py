@@ -18,7 +18,9 @@ edited. The first change keeps a copy of the file as it was
 
 The UI can also fine-tune an RF-DETR on detections files
 (train_rfdetr.py) and run a fine-tuned model on a video
-(process_video.py --no-render), as background jobs.
+(process_video.py --no-render), as background jobs, and propose boxes
+for the frame being edited with a cloud, local or trained model
+(label_assist.py).
 """
 
 from __future__ import annotations
@@ -43,6 +45,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import uvicorn
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -58,8 +61,14 @@ import train_rfdetr
 import training_data
 from file_lookup import VIDEO_EXTENSIONS, best_video, walk_files
 from jobs import JobManager
+from label_assist import SOURCES, AssistError, LabelAssist
 from options import normalize_name
 from rfdetr_detector import MODEL_SIZES, WEIGHTS_FILE
+
+# ANTHROPIC_API_KEY / LOCATE_ANYTHING_* for Label Assist, as in
+# process_video.py.
+load_dotenv(Path(__file__).resolve().parent / ".env")
+load_dotenv()
 
 UI_DIR = Path(__file__).parent / "annotator_ui"
 
@@ -639,6 +648,18 @@ class DetectRequest(BaseModel):
 # -- App ------------------------------------------------------------
 
 
+class AssistClass(BaseModel):
+    name: str = Field(min_length=1)
+    description: str = ""
+
+
+class AssistRequest(BaseModel):
+    source: str
+    # Cloud model id, RF-DETR size, or trained model folder.
+    model: str | None = None
+    classes: list[AssistClass] = Field(min_length=1)
+
+
 class OpenRequest(BaseModel):
     detections: str = Field(min_length=1)
     video: str | None = None
@@ -651,6 +672,11 @@ def create_app(root: Path, initial: tuple[Path, Path] | None = None) -> FastAPI:
     jobs = JobManager()
     # A training run outliving the server would hold the GPU unseen.
     atexit.register(jobs.shutdown)
+    assist = LabelAssist()
+    atexit.register(assist.close)
+    # The COCO names import rfdetr (slow); load them before Label Assist
+    # asks.
+    threading.Thread(target=coco_classes, daemon=True).start()
 
     def rel(path: Path | None) -> str | None:
         if path is None:
@@ -897,16 +923,70 @@ def create_app(root: Path, initial: tuple[Path, Path] | None = None) -> FastAPI:
         print(f"Uploaded {rel(target)}")
         return {"video": rel(target)}
 
-    @app.get("/api/models")
-    def models() -> dict:
+    def trained_models() -> list[dict]:
+        """Models under the root, newest first, with relative paths."""
         manifests: list[Path] = []
         find_files(root, manifests)
         found = [m for m in map(read_model, manifests) if m is not None]
         found.sort(key=lambda m: -m["modified"])
+        return [{**m, "path": rel(m["path"])} for m in found]
+
+    @app.get("/api/models")
+    def models() -> dict:
+        return {"models": trained_models(), "defaults": train_defaults()}
+
+    # -- Label Assist -----------------------------------------------
+
+    @app.get("/api/assist")
+    def assist_sources(s: str | None = Query(None)) -> dict:
+        session = current(s)
+        trained = [
+            {k: m[k] for k in ("path", "name", "classes", "threshold")}
+            for m in trained_models()
+        ]
         return {
-            "models": [{**m, "path": rel(m["path"])} for m in found],
-            "defaults": train_defaults(),
+            "sources": assist.sources(session.store.info, trained),
+            "coco": list(coco_classes().values()),
         }
+
+    @app.post("/api/assist/{index}")
+    def assist_frame(
+        index: int, req: AssistRequest, s: str | None = Query(None)
+    ) -> dict:
+        """Proposed boxes for a frame; nothing is saved."""
+        session = current(s)
+        frame_or_404(session, index)
+        if req.source not in SOURCES:
+            raise HTTPException(400, f"unknown source {req.source}")
+        model = req.model
+        if req.source == "trained":
+            folder = resolve(model or "")
+            if read_model(folder / train_rfdetr.MANIFEST) is None:
+                raise HTTPException(400, f"{model} is not a trained model")
+            model = str(folder)
+        try:
+            data = session.reader.frame(index)
+        except KeyError:
+            raise HTTPException(404, f"cannot read frame {index}")
+        frame = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+        try:
+            result = assist.detect(
+                frame,
+                req.source,
+                model,
+                [(c.name, c.description) for c in req.classes],
+                session.store.info,
+                coco_classes(),
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        except AssistError as exc:
+            raise HTTPException(502, str(exc))
+        print(
+            f"Label Assist on frame {index}: {len(result['boxes'])} boxes "
+            f"from {result['model']} in {result['seconds']:g} s"
+        )
+        return {"index": index, **result}
 
     @app.get("/api/jobs")
     def list_jobs() -> dict:

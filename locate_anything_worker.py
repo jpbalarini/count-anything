@@ -4,12 +4,13 @@ Loads liblocate_anything (the C ABI of locate-anything.cpp, built with
 -DLA_SHARED=ON) once, then answers one request per frame so the model is
 not reloaded every time:
 
-    python locate_anything_worker.py LIB MODEL THREADS MODE PROMPT
+    python locate_anything_worker.py LIB MODEL THREADS MODE
 
 Protocol on stdin / stdout, both directions are length-prefixed messages
 (4-byte little-endian size, then the payload):
 
-    parent -> worker   an encoded image (JPEG / PNG bytes)
+    parent -> worker   two messages per request: the prompt (UTF-8), then
+                       an encoded image (JPEG / PNG bytes)
     worker -> parent   1 status byte (0 ok, 1 error) + body; for "ok" the
                        body is the detections JSON, or empty for the
                        "model loaded" message sent once at startup; for
@@ -33,7 +34,7 @@ MODES = {"hybrid": 0, "slow": 1, "fast": 2}
 
 
 def main() -> None:
-    lib_path, model_path, threads, mode, prompt = sys.argv[1:6]
+    lib_path, model_path, threads, mode = sys.argv[1:5]
 
     # Keep the protocol channel private: anything the C library prints to
     # stdout goes to stderr instead of corrupting the messages.
@@ -70,18 +71,24 @@ def main() -> None:
         sys.exit(1)
     send(OK)
 
-    prompt_b, mode_i = prompt.encode(), MODES[mode]
+    def receive() -> bytes | None:
+        """One message, or None at EOF."""
+        header = inp.read(4)
+        if len(header) < 4:
+            return None
+        (size,) = struct.unpack("<I", header)
+        body = inp.read(size)
+        return body if len(body) == size else None
+
+    mode_i = MODES[mode]
     try:
         while True:
-            header = inp.read(4)
-            if len(header) < 4:
-                break
-            (size,) = struct.unpack("<I", header)
-            image = inp.read(size)
-            if len(image) < size:
+            prompt = receive()
+            image = receive() if prompt is not None else None
+            if image is None:
                 break
             ptr = lib.la_capi_locate_buffer(
-                ctx, image, len(image), prompt_b, mode_i
+                ctx, image, len(image), prompt, mode_i
             )
             if ptr:
                 send(OK, ctypes.string_at(ptr))
