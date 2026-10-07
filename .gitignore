@@ -18,3 +18,5 @@ wheels/
 
 # Fine-tuned models (train_rfdetr.py)
 models/
+
+videos/
