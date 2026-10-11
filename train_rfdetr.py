@@ -8,7 +8,9 @@ on them and run that on every frame of the same or similar videos:
     python process_video.py other.mp4 --weights models/apples ...
 
 Each detections file is paired with the video named in it (found under
---root), or with the matching --videos entry. The output folder gets:
+--root), or with the matching --videos entry. Or train on a project of
+the annotator's workspace (--project), on its labeled and pre-labeled
+images. The output folder gets:
 
     model.json                  classes, training settings, scores
     checkpoint_best_total.pth   the weights to use (--weights)
@@ -42,6 +44,7 @@ from training_data import (
     DEFAULT_VAL_FRACTION,
     Source,
     build_dataset,
+    build_project_dataset,
 )
 
 MANIFEST = MANIFEST_FILE
@@ -90,6 +93,10 @@ Several files, only the frames fixed by hand, one class, every 2nd frame:
 
     python train_rfdetr.py a.json b.json --only-edited \\
         --classes apple --every 2 -o models/apples-reviewed
+
+A project of the annotator (the model goes to the project's models/):
+
+    python train_rfdetr.py --project workspace/highway --only-edited
 """
 
 
@@ -104,9 +111,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument(
         "detections",
-        nargs="+",
+        nargs="*",
         metavar="DETECTIONS.json",
         help="Detections files to learn from.",
+    )
+    p.add_argument(
+        "--project",
+        metavar="DIR",
+        help=(
+            "Learn from a project of the annotator's workspace instead: "
+            "its labeled images, and its pre-labeled ones (boxes of "
+            "--min-score or more) unless --only-edited."
+        ),
     )
     p.add_argument(
         "--videos",
@@ -160,7 +176,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     data.add_argument(
         "--only-edited",
         action="store_true",
-        help="Use only the frames changed in the annotator.",
+        help=(
+            "Use only the frames changed in the annotator (with "
+            "--project: only the images labeled by hand)."
+        ),
     )
     data.add_argument(
         "--every",
@@ -271,6 +290,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
 
     args = p.parse_args(argv)
+    if bool(args.project) == bool(args.detections):
+        p.error("give either detections files or --project")
     if args.videos and len(args.videos) != len(args.detections):
         p.error("--videos needs one video per detections file")
     if args.epochs < 1:
@@ -332,6 +353,14 @@ def pick_device(wanted: str) -> str:
 
 
 def default_output(detections: str, model: str) -> Path:
+    if Path(detections).is_dir():
+        # A project: its own models/ folder.
+        path = Path(detections) / "models" / f"{Path(detections).name}-{model}"
+        n = 2
+        while path.exists():
+            path = path.with_name(f"{Path(detections).name}-{model}-{n}")
+            n += 1
+        return path
     stem = Path(detections).stem
     for suffix in ("_dets", "-dets", "_detections"):
         stem = stem.removesuffix(suffix)
@@ -573,11 +602,16 @@ def main(argv: list[str] | None = None) -> int:
     reporter = Reporter(args.progress_json)
     root = Path(args.root)
     out = Path(args.output) if args.output else default_output(
-        args.detections[0], args.model
+        args.project or args.detections[0], args.model
     )
 
     try:
-        sources = resolve_sources(args.detections, args.videos, root)
+        if args.project:
+            if not Path(args.project, "project.json").is_file():
+                raise ValueError(f"{args.project} is not a project")
+            sources = []
+        else:
+            sources = resolve_sources(args.detections, args.videos, root)
         prepare_output(out, args.overwrite)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -585,6 +619,8 @@ def main(argv: list[str] | None = None) -> int:
 
     # -- Dataset ----------------------------------------------------
     print(f"Building the training data in {out / 'dataset'}")
+    if args.project:
+        print(f"  project {args.project}")
     for source in sources:
         print(f"  {source.detections}  ({source.video})")
 
@@ -600,18 +636,24 @@ def main(argv: list[str] | None = None) -> int:
             bar.update(done - bar.n)
         reporter.emit(force=done == total, phase="dataset", done=done, total=total)
 
+    options = {
+        "classes": split_tokens(args.classes) if args.classes else None,
+        "min_score": args.min_score,
+        "val_fraction": args.val_fraction,
+        "every": args.every,
+        "image_size": args.image_size,
+        "on_progress": on_frame,
+    }
     try:
-        summary = build_dataset(
-            sources,
-            out / "dataset",
-            classes=split_tokens(args.classes) if args.classes else None,
-            min_score=args.min_score,
-            val_fraction=args.val_fraction,
-            every=args.every,
-            only_edited=args.only_edited,
-            image_size=args.image_size,
-            on_progress=on_frame,
-        )
+        if args.project:
+            summary = build_project_dataset(
+                Path(args.project), out / "dataset",
+                only_labeled=args.only_edited, **options,
+            )
+        else:
+            summary = build_dataset(
+                sources, out / "dataset", only_edited=args.only_edited, **options
+            )
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

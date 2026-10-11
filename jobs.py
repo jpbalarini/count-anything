@@ -29,6 +29,8 @@ LOG_LINES = 400
 # the best weights) before it is killed.
 STOP_GRACE = 120
 # "Detecting:  45%|████▌     | 272/605 [00:10<00:12, 26.1frame/s]"
+# Terminal colors / styles (rich's tables in RF-DETR's output).
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 TQDM = re.compile(r"^(?P<desc>[^:|]{1,60}):\s*(?P<pct>\d+)%\|.*?\|\s*(?P<n>\d+)/(?P<total>\d+)")
 
 
@@ -73,6 +75,7 @@ class Job:
 
     def _line(self, line: str, final: bool) -> None:
         """A complete line (`final`) or a progress bar redraw."""
+        line = ANSI.sub("", line)
         if line.startswith(PROGRESS_PREFIX):
             try:
                 self.progress.update(json.loads(line[len(PROGRESS_PREFIX):]))

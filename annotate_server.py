@@ -21,6 +21,10 @@ The UI can also fine-tune an RF-DETR on detections files
 (process_video.py --no-render), as background jobs, and propose boxes
 for the frame being edited with a cloud, local or trained model
 (label_assist.py).
+
+The home page (/) is the workspace (workspace.py): folders and projects,
+each project a dataset of uploaded pictures and video frames, labeled
+in the same annotator (/annotate?project=ID) and trained on.
 """
 
 from __future__ import annotations
@@ -51,19 +55,35 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+import train_rfdetr
+import training_data
 from detections_io import (
     DetectionsFile,
     is_detections_file,
     load_detections,
     write_detections,
 )
-import train_rfdetr
-import training_data
 from file_lookup import VIDEO_EXTENSIONS, best_video, walk_files
 from jobs import JobManager
 from label_assist import SOURCES, AssistError, LabelAssist
 from options import normalize_name
 from rfdetr_detector import MODEL_SIZES, WEIGHTS_FILE
+from workspace import (
+    IMAGE_EXTENSIONS,
+    PROJECT_TYPES,
+    STATUSES,
+    WORKSPACE_DIR,
+    Project,
+    Workspace,
+    decode_image,
+    encode_jpeg,
+    make_thumbnail,
+    media_type,
+    now_iso,
+    sample_indices,
+    sample_video,
+    video_info,
+)
 
 # ANTHROPIC_API_KEY / LOCATE_ANYTHING_* for Label Assist, as in
 # process_video.py.
@@ -71,10 +91,9 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 load_dotenv()
 
 UI_DIR = Path(__file__).parent / "annotator_ui"
+STUDIO_DIR = Path(__file__).parent / "studio_ui"
 
 JPEG_QUALITY = 90
-THUMB_WIDTH = 240
-THUMB_QUALITY = 75
 # Full-size frames kept in memory (encoded JPEG).
 FRAME_CACHE_SIZE = 48
 # Short forward jumps are read frame by frame instead of seeking, so
@@ -92,6 +111,9 @@ MODELS_DIR = "models"
 UPLOADS_DIR = "videos/uploads"
 # Seconds between checks of whether the server's code changed on disk.
 CODE_CHECK_INTERVAL = 5.0
+# Annotator sessions kept open at once (one per tab, roughly); the
+# oldest is closed when another opens.
+MAX_SESSIONS = 6
 
 
 class CodeWatch:
@@ -132,20 +154,6 @@ class CodeWatch:
                     )
                     break
         return self._outdated
-
-
-def encode_jpeg(frame: np.ndarray, quality: int) -> bytes:
-    ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
-    if not ok:
-        raise RuntimeError("JPEG encoding failed")
-    return buf.tobytes()
-
-
-def make_thumbnail(frame: np.ndarray) -> bytes:
-    height, width = frame.shape[:2]
-    size = (THUMB_WIDTH, max(1, round(height * THUMB_WIDTH / width)))
-    small = cv2.resize(frame, size, interpolation=cv2.INTER_AREA)
-    return encode_jpeg(small, THUMB_QUALITY)
 
 
 class FrameReader:
@@ -430,8 +438,153 @@ class Session:
             daemon=True,
         ).start()
 
+    # What the endpoints use; ProjectSession has the same.
+
+    kind = "video"
+
+    @property
+    def info(self) -> dict:
+        return self.store.info
+
+    def has(self, index: int) -> bool:
+        return index in self.store.frames
+
+    def boxes(self, index: int) -> list[dict] | None:
+        return self.store.frames[index]
+
+    def save(self, index: int, boxes: list[Box]) -> dict:
+        return {"boxes": self.store.set_frame(index, boxes)}
+
+    def image(self, index: int) -> tuple[bytes, str]:
+        return self.reader.frame(index), "image/jpeg"
+
+    def thumbnail(self, index: int) -> bytes:
+        return self.reader.thumbnail(index)
+
+    def array(self, index: int) -> np.ndarray:
+        return decode_image(self.reader.frame(index))
+
+    def classes(self) -> list[str]:
+        return self.store.classes()
+
+    def set_classes(self, classes: list[str]) -> None:
+        self.store.set_classes(classes)
+
+    def describe(self, rel) -> dict:
+        store, reader = self.store, self.reader
+        return {
+            "id": self.id,
+            "mode": "video",
+            "video": self.video.name,
+            "video_path": rel(self.video),
+            "detections": self.detections.name,
+            "detections_path": rel(self.detections),
+            "warnings": self.warnings,
+            "meta": store.info,
+            "width": reader.width,
+            "height": reader.height,
+            "fps": reader.fps,
+            "total_frames": reader.total_frames,
+            "classes": store.classes(),
+            "suggestions": self.suggestions,
+            "edited": store.edited,
+            # [index, box count (-1 = detection failed)] per frame.
+            "frames": [
+                [i, -1 if store.frames[i] is None else len(store.frames[i])]
+                for i in sorted(store.frames)
+            ],
+        }
+
     def close(self) -> None:
         self.reader.close()
+
+
+class ProjectSession:
+    """The images of a project (or of one of its batches), open in the
+    annotator. Frame indices are image ids. Saving an image's boxes
+    marks it labeled."""
+
+    kind = "project"
+
+    def __init__(self, project: Project, batch_id: str | None = None):
+        self.id = uuid.uuid4().hex[:10]
+        self.project = project
+        self.batch = project.batch(batch_id) if batch_id else None
+        self.indices = project.batch_images(batch_id)
+        self._open = set(self.indices)
+        self.info: dict = {}
+        self.warnings: list[str] = []
+
+    def has(self, index: int) -> bool:
+        return index in self._open and index in self.project.images
+
+    def boxes(self, index: int) -> list[dict]:
+        return self.project.images[index]["boxes"]
+
+    def save(self, index: int, boxes: list[Box]) -> dict:
+        cleaned = self.project.set_boxes(index, [b.model_dump() for b in boxes])
+        return {"boxes": cleaned, "status": "labeled"}
+
+    def image(self, index: int) -> tuple[bytes, str]:
+        path = self.project.image_path(index)
+        try:
+            return path.read_bytes(), media_type(path)
+        except OSError:
+            raise KeyError(index)
+
+    def thumbnail(self, index: int) -> bytes:
+        return self.project.thumbnail(index)
+
+    def array(self, index: int) -> np.ndarray:
+        frame = cv2.imread(str(self.project.image_path(index)))
+        if frame is None:
+            raise KeyError(index)
+        return frame
+
+    def classes(self) -> list[str]:
+        return self.project.classes()
+
+    def set_classes(self, classes: list[str]) -> None:
+        self.project.set_classes(classes)
+
+    def describe(self, rel) -> dict:
+        project = self.project
+        with project.lock:
+            images = [
+                (i, project.images[i]) for i in self.indices if i in project.images
+            ]
+            first = images[0][1] if images else {"width": 0, "height": 0}
+            return {
+                "id": self.id,
+                "mode": "project",
+                "project": {"id": project.id, "name": project.name},
+                "batch": (
+                    {"id": self.batch["id"], "name": self.batch["name"],
+                     "kind": self.batch.get("kind")}
+                    if self.batch else None
+                ),
+                # The key the page remembers its position by.
+                "detections_path": f"project:{project.id}:{self.batch['id'] if self.batch else 'all'}",
+                "warnings": [],
+                "meta": {"detector": None},
+                "width": first["width"],
+                "height": first["height"],
+                "fps": None,
+                "total_frames": len(images),
+                "classes": project.classes(),
+                "suggestions": [],
+                "edited": [i for i, r in images if r.get("status") == "labeled"],
+                "frames": [[i, len(r["boxes"])] for i, r in images],
+                # [id, width, height, file name, status] per image.
+                "images": [
+                    [i, r["width"], r["height"], Path(r["file_name"]).name,
+                     r.get("status", "unlabeled")]
+                    for i, r in images
+                ],
+            }
+
+    def close(self) -> None:
+        pass
 
 
 # -- Finding files --------------------------------------------------
@@ -495,13 +648,16 @@ def video_of(detections: Path, root: Path) -> tuple[str | None, Path | None]:
 
 
 def find_files(
-    root: Path, models: list[Path] | None = None
+    root: Path, models: list[Path] | None = None, skip: Path | None = None
 ) -> tuple[list[dict], list[Path]]:
     """Detections files under `root` (newest first) and the videos.
-    The model manifests found are added to `models`."""
+    The model manifests found are added to `models`. Nothing under
+    `skip` (the workspace, which has its own lists) is looked at."""
     videos: list[Path] = []
     jsons: list[Path] = []
     for path in walk_files(root):
+        if skip is not None and path.is_relative_to(skip):
+            continue
         suffix = path.suffix.lower()
         if suffix in VIDEO_EXTENSIONS:
             videos.append(path)
@@ -549,7 +705,9 @@ def read_model(manifest: Path) -> dict | None:
     dataset = data.get("dataset") or {}
     return {
         "path": folder,
-        "name": folder.name,
+        # The name given in the UI (kept in model.json), else the folder's.
+        "name": str(data.get("name") or folder.name),
+        "folder": folder.name,
         "classes": data.get("classes", []),
         "threshold": data.get("threshold"),
         "base_model": data.get("base_model"),
@@ -559,7 +717,14 @@ def read_model(manifest: Path) -> dict | None:
         "stopped_early": data.get("stopped_early", False),
         "epochs_run": (data.get("training") or {}).get("epochs_run"),
         "images": dataset.get("images"),
-        "sources": [s.get("detections") for s in dataset.get("sources", [])],
+        "boxes_per_class": dataset.get("boxes_per_class"),
+        "sources": [
+            s.get("detections") or s.get("name") for s in dataset.get("sources", [])
+        ],
+        "project": dataset.get("project"),
+        "options": dataset.get("options"),
+        "minutes": (data.get("training") or {}).get("minutes"),
+        "calibration": data.get("calibration"),
         "modified": manifest.stat().st_mtime,
     }
 
@@ -622,7 +787,9 @@ def train_defaults() -> dict:
 
 
 class TrainRequest(BaseModel):
-    detections: list[str] = Field(min_length=1)
+    detections: list[str] = []
+    # A workspace project id, instead of detections files.
+    project: str | None = None
     classes: list[str] | None = None
     model: str = "small"
     epochs: int = Field(20, ge=1, le=2000)
@@ -636,6 +803,10 @@ class TrainRequest(BaseModel):
     output: str | None = None
 
 
+class ModelUpdate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+
+
 class DetectRequest(BaseModel):
     model: str = Field(min_length=1)
     video: str = Field(min_length=1)
@@ -643,6 +814,8 @@ class DetectRequest(BaseModel):
     # None: the one chosen for the model when it was trained.
     threshold: float | None = Field(None, ge=0, le=1)
     sample_rate: float | None = Field(None, gt=0)
+    # The workspace project the job is run from (shown on its page).
+    project: str | None = None
 
 
 # -- App ------------------------------------------------------------
@@ -660,14 +833,76 @@ class AssistRequest(BaseModel):
     classes: list[AssistClass] = Field(min_length=1)
 
 
+class AutoLabelRequest(BaseModel):
+    source: str
+    # Cloud model id, RF-DETR size, or trained model folder.
+    model: str | None = None
+    classes: list[AssistClass] = Field(min_length=1)
+    # "unlabeled": only images without labels; "todo": also the
+    # pre-labeled ones (their boxes are replaced). Labeled images are
+    # never touched.
+    images: str = Field("unlabeled", pattern="^(unlabeled|todo)$")
+    # Boxes below it are left out; None: the detector's own threshold.
+    min_confidence: float | None = Field(None, ge=0, le=1)
+
+
 class OpenRequest(BaseModel):
     detections: str = Field(min_length=1)
     video: str | None = None
 
 
-def create_app(root: Path, initial: tuple[Path, Path] | None = None) -> FastAPI:
+class NodeCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    # Folder id; None / "" for the top level.
+    parent: str | None = None
+    type: str = "object-detection"
+
+
+class NodeUpdate(BaseModel):
+    name: str | None = Field(None, min_length=1, max_length=200)
+    # Move to this folder id ("" = the top level); None leaves it.
+    parent: str | None = None
+
+
+class BatchCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    kind: str = Field(pattern="^(images|video)$")
+
+
+class BatchUpdate(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+
+
+class ImagesStatus(BaseModel):
+    # The images: these ids, or those of a batch (with `from_status`).
+    ids: list[int] = []
+    batch: str | None = None
+    from_status: str | None = None
+    status: str
+
+
+class ImageIds(BaseModel):
+    ids: list[int] = Field(min_length=1)
+
+
+class ClassRename(BaseModel):
+    old: str = Field(min_length=1)
+    new: str = Field(min_length=1)
+
+
+class AnnotateRequest(BaseModel):
+    batch: str | None = None
+
+
+def create_app(
+    root: Path,
+    initial: tuple[Path, Path] | None = None,
+    workspace: Workspace | None = None,
+) -> FastAPI:
     root = root.resolve()
-    state: dict[str, Session | None] = {"session": None}
+    ws = workspace or Workspace(root / WORKSPACE_DIR)
+    # Open annotator sessions by id, oldest first.
+    sessions: OrderedDict[str, Session | ProjectSession] = OrderedDict()
     lock = threading.Lock()
     jobs = JobManager()
     # A training run outliving the server would hold the GPU unseen.
@@ -690,12 +925,18 @@ def create_app(root: Path, initial: tuple[Path, Path] | None = None) -> FastAPI:
         p = Path(path).expanduser()
         return Path(os.path.abspath(p if p.is_absolute() else root / p))
 
-    def open_session(video: Path, detections: Path) -> Session:
-        session = Session(video, detections)
+    def add_session(session):
         with lock:
-            old, state["session"] = state["session"], session
-        if old is not None:
+            sessions[session.id] = session
+            closed = []
+            while len(sessions) > MAX_SESSIONS:
+                closed.append(sessions.popitem(last=False)[1])
+        for old in closed:
             old.close()
+        return session
+
+    def open_session(video: Path, detections: Path) -> Session:
+        session = add_session(Session(video, detections))
         if session.warnings:
             print(
                 "warning: detections file doesn't match this video: "
@@ -707,26 +948,29 @@ def create_app(root: Path, initial: tuple[Path, Path] | None = None) -> FastAPI:
     if initial is not None:
         open_session(*initial)
 
-    def current(s: str | None = None) -> Session:
-        """The open session; `s` (the id the page was loaded with) must
-        match it, so a tab never edits files another tab replaced."""
-        session = state["session"]
-        if session is None:
-            raise HTTPException(409, "no files are open")
-        if s is not None and s != session.id:
-            raise HTTPException(
-                409, "other files were opened since this page was loaded"
-            )
-        return session
+    def current(s: str | None = None) -> Session | ProjectSession:
+        """The session `s` (the id the page was loaded with), or the
+        newest one. A page never edits files after its session was
+        closed (too many others were opened since)."""
+        with lock:
+            if s:
+                session = sessions.get(s)
+                if session is None:
+                    raise HTTPException(
+                        409, "other files were opened since this page was loaded"
+                    )
+                return session
+            if not sessions:
+                raise HTTPException(409, "no files are open")
+            return next(reversed(sessions.values()))
 
-    def frame_or_404(session: Session, index: int) -> None:
-        if index not in session.store.frames:
-            raise HTTPException(
-                404, f"frame {index} is not in the detections file"
-            )
+    def frame_or_404(session, index: int) -> None:
+        if not session.has(index):
+            raise HTTPException(404, f"frame {index} is not open")
 
     app = FastAPI(title="Detections annotator")
     app.mount("/static", StaticFiles(directory=UI_DIR), name="static")
+    app.mount("/studio", StaticFiles(directory=STUDIO_DIR), name="studio")
 
     code = CodeWatch()
 
@@ -742,11 +986,15 @@ def create_app(root: Path, initial: tuple[Path, Path] | None = None) -> FastAPI:
 
     @app.get("/")
     def index() -> FileResponse:
+        return FileResponse(STUDIO_DIR / "index.html")
+
+    @app.get("/annotate")
+    def annotate_page() -> FileResponse:
         return FileResponse(UI_DIR / "index.html")
 
     @app.get("/api/files")
     def files() -> dict:
-        found, videos = find_files(root)
+        found, videos = find_files(root, skip=ws.path)
         return {
             "root": str(root),
             "detections": [
@@ -783,37 +1031,15 @@ def create_app(root: Path, initial: tuple[Path, Path] | None = None) -> FastAPI:
         return {"id": session.id}
 
     @app.get("/api/project")
-    def project() -> dict:
-        session = current()
-        store, reader = session.store, session.reader
-        return {
-            "id": session.id,
-            "root": str(root),
-            "video": session.video.name,
-            "video_path": rel(session.video),
-            "detections": session.detections.name,
-            "detections_path": rel(session.detections),
-            "warnings": session.warnings,
-            "meta": store.info,
-            "width": reader.width,
-            "height": reader.height,
-            "fps": reader.fps,
-            "total_frames": reader.total_frames,
-            "classes": store.classes(),
-            "suggestions": session.suggestions,
-            "edited": store.edited,
-            # [index, box count (-1 = detection failed)] per frame.
-            "frames": [
-                [i, -1 if store.frames[i] is None else len(store.frames[i])]
-                for i in sorted(store.frames)
-            ],
-        }
+    def project(s: str | None = Query(None)) -> dict:
+        session = current(s)
+        return {"root": str(root), **session.describe(rel)}
 
     @app.get("/api/frames/{index}")
     def get_frame(index: int, s: str | None = Query(None)) -> dict:
         session = current(s)
         frame_or_404(session, index)
-        return {"index": index, "boxes": session.store.frames[index]}
+        return {"index": index, "boxes": session.boxes(index)}
 
     @app.put("/api/frames/{index}")
     def put_frame(
@@ -821,20 +1047,20 @@ def create_app(root: Path, initial: tuple[Path, Path] | None = None) -> FastAPI:
     ) -> dict:
         session = current(s)
         frame_or_404(session, index)
-        boxes = session.store.set_frame(index, update.boxes)
-        return {"index": index, "boxes": boxes}
+        return {"index": index, **session.save(index, update.boxes)}
 
     @app.put("/api/classes")
     def put_classes(update: ClassesUpdate, s: str | None = Query(None)) -> dict:
         session = current(s)
-        session.store.set_classes(update.classes)
-        return {"classes": session.store.classes()}
+        session.set_classes(update.classes)
+        return {"classes": session.classes()}
 
-    def jpeg(data: bytes) -> Response:
-        # Image URLs carry the session id, so caching can't mix videos.
+    def image_response(data: bytes, kind: str = "image/jpeg") -> Response:
+        # Image URLs carry the session (or project) id, so caching can't
+        # mix videos.
         return Response(
             data,
-            media_type="image/jpeg",
+            media_type=kind,
             headers={"Cache-Control": "private, max-age=3600"},
         )
 
@@ -843,7 +1069,7 @@ def create_app(root: Path, initial: tuple[Path, Path] | None = None) -> FastAPI:
         session = current(s)
         frame_or_404(session, index)
         try:
-            return jpeg(session.reader.frame(index))
+            return image_response(*session.image(index))
         except KeyError:
             raise HTTPException(404, f"cannot read frame {index}")
 
@@ -852,7 +1078,7 @@ def create_app(root: Path, initial: tuple[Path, Path] | None = None) -> FastAPI:
         session = current(s)
         frame_or_404(session, index)
         try:
-            return jpeg(session.reader.thumbnail(index))
+            return image_response(session.thumbnail(index))
         except KeyError:
             raise HTTPException(404, f"cannot read frame {index}")
 
@@ -873,9 +1099,10 @@ def create_app(root: Path, initial: tuple[Path, Path] | None = None) -> FastAPI:
         return shlex.join(shown)
 
     def video_for(detections: Path) -> Path:
-        session = state["session"]
-        if session is not None and session.detections == detections:
-            return session.video
+        with lock:
+            for session in sessions.values():
+                if getattr(session, "detections", None) == detections:
+                    return session.video
         source, video = video_of(detections, root)
         if video is None:
             raise HTTPException(
@@ -923,10 +1150,29 @@ def create_app(root: Path, initial: tuple[Path, Path] | None = None) -> FastAPI:
         print(f"Uploaded {rel(target)}")
         return {"video": rel(target)}
 
+    def project_models(project: Project) -> list[dict]:
+        """A project's models, newest first."""
+        folder = project.models_dir
+        found = []
+        if folder.is_dir():
+            for child in folder.iterdir():
+                model = read_model(child / train_rfdetr.MANIFEST)
+                if model is not None:
+                    found.append(model)
+        found.sort(key=lambda m: -m["modified"])
+        return [{**m, "path": rel(m["path"])} for m in found]
+
     def trained_models() -> list[dict]:
-        """Models under the root, newest first, with relative paths."""
+        """Models under the root and in the workspace's projects, newest
+        first, with relative paths."""
         manifests: list[Path] = []
-        find_files(root, manifests)
+        find_files(root, manifests, skip=ws.path)
+        for node in ws.nodes().values():
+            if node.kind == "project" and (node.path / "models").is_dir():
+                manifests += [
+                    child / train_rfdetr.MANIFEST
+                    for child in (node.path / "models").iterdir()
+                ]
         found = [m for m in map(read_model, manifests) if m is not None]
         found.sort(key=lambda m: -m["modified"])
         return [{**m, "path": rel(m["path"])} for m in found]
@@ -937,17 +1183,27 @@ def create_app(root: Path, initial: tuple[Path, Path] | None = None) -> FastAPI:
 
     # -- Label Assist -----------------------------------------------
 
-    @app.get("/api/assist")
-    def assist_sources(s: str | None = Query(None)) -> dict:
-        session = current(s)
+    def assist_choices(info: dict, project: Project | None) -> dict:
+        """What Label Assist can run (with a project: its own models
+        first)."""
         trained = [
             {k: m[k] for k in ("path", "name", "classes", "threshold")}
             for m in trained_models()
         ]
+        if project is not None:
+            mine = str(project.models_dir)
+            trained.sort(key=lambda m: not str(resolve(m["path"])).startswith(mine))
         return {
-            "sources": assist.sources(session.store.info, trained),
+            "sources": assist.sources(info, trained),
             "coco": list(coco_classes().values()),
         }
+
+    @app.get("/api/assist")
+    def assist_sources(s: str | None = Query(None)) -> dict:
+        session = current(s)
+        return assist_choices(
+            session.info, session.project if session.kind == "project" else None
+        )
 
     @app.post("/api/assist/{index}")
     def assist_frame(
@@ -965,17 +1221,16 @@ def create_app(root: Path, initial: tuple[Path, Path] | None = None) -> FastAPI:
                 raise HTTPException(400, f"{model} is not a trained model")
             model = str(folder)
         try:
-            data = session.reader.frame(index)
+            frame = session.array(index)
         except KeyError:
             raise HTTPException(404, f"cannot read frame {index}")
-        frame = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
         try:
             result = assist.detect(
                 frame,
                 req.source,
                 model,
                 [(c.name, c.description) for c in req.classes],
-                session.store.info,
+                session.info,
                 coco_classes(),
             )
         except ValueError as exc:
@@ -1009,13 +1264,38 @@ def create_app(root: Path, initial: tuple[Path, Path] | None = None) -> FastAPI:
             raise HTTPException(409, str(exc))
         return {"removed": job_id}
 
-    @app.delete("/api/models")
-    def remove_model(path: str = Query(min_length=1)) -> dict:
+    def model_folder(path: str) -> Path:
+        """The folder of a trained model under the root or the workspace."""
         folder = resolve(path)
-        if folder == root or not folder.is_relative_to(root):
+        if folder in (root, ws.path) or not (
+            folder.is_relative_to(root) or folder.is_relative_to(ws.path)
+        ):
             raise HTTPException(400, f"{path} is not a model under {root}")
         if read_model(folder / train_rfdetr.MANIFEST) is None:
             raise HTTPException(400, f"{path} is not a trained model")
+        return folder
+
+    @app.patch("/api/models")
+    def rename_model(update: ModelUpdate, path: str = Query(min_length=1)) -> dict:
+        """Give a model another name. Only model.json changes: the folder
+        keeps its name, so the paths that point at it (detections files,
+        --weights commands) still work."""
+        folder = model_folder(path)
+        busy = jobs.using(str(folder))
+        if busy is not None:
+            raise HTTPException(409, f"'{busy.title}' is using it; stop it first")
+        manifest = folder / train_rfdetr.MANIFEST
+        data = json.loads(manifest.read_text())
+        data["name"] = update.name.strip()
+        tmp = manifest.with_name(f".{manifest.name}.tmp")
+        tmp.write_text(json.dumps(data, indent=2))
+        os.replace(tmp, manifest)
+        print(f"Renamed the model {rel(folder)} to {data['name']}")
+        return {**read_model(manifest), "path": rel(folder)}
+
+    @app.delete("/api/models")
+    def remove_model(path: str = Query(min_length=1)) -> dict:
+        folder = model_folder(path)
         busy = jobs.using(str(folder))
         if busy is not None:
             raise HTTPException(409, f"'{busy.title}' is using it; stop it first")
@@ -1055,25 +1335,36 @@ def create_app(root: Path, initial: tuple[Path, Path] | None = None) -> FastAPI:
 
         if req.model not in MODEL_SIZES:
             raise HTTPException(400, f"unknown model size {req.model}")
-        detections = []
-        for name in req.detections:
-            path = resolve(name)
-            if not path.is_file():
-                raise HTTPException(400, f"no such file: {name}")
-            detections.append(path)
-        videos = [video_for(d) for d in detections]
+        project = None
+        if req.project:
+            project = project_or_404(req.project)
+            # train_rfdetr.py reads the dataset from disk.
+            project.flush()
+            inputs = ["--project", str(project.path)]
+        elif req.detections:
+            detections = []
+            for name in req.detections:
+                path = resolve(name)
+                if not path.is_file():
+                    raise HTTPException(400, f"no such file: {name}")
+                detections.append(path)
+            videos = [video_for(d) for d in detections]
+            inputs = [*map(str, detections), "--videos", *map(str, videos)]
+        else:
+            raise HTTPException(400, "choose detections files or a project")
         if req.output and req.output.strip():
             out = resolve(req.output.strip())
             if out.exists() and any(out.iterdir()):
                 raise HTTPException(400, f"{req.output} already exists")
+        elif project is not None:
+            out = unique_path(project.models_dir / f"{slug(project.path.name)}-{req.model}")
         else:
             name = t.default_output(str(detections[0]), req.model).name
             out = unique_path(root / MODELS_DIR / slug(name))
 
         command = [
             sys.executable, str(TRAIN_SCRIPT),
-            *map(str, detections),
-            "--videos", *map(str, videos),
+            *inputs,
             "-o", str(out),
             "--progress-json",
         ]
@@ -1098,6 +1389,8 @@ def create_app(root: Path, initial: tuple[Path, Path] | None = None) -> FastAPI:
         if classes:
             command += ["--classes", *classes]
         result = {"model": rel(out)}
+        if project is not None:
+            result["project"] = project.id
         if dry:
             return job_response(None, command, True, result)
         job = start("train", f"Train {out.name}", command, result)
@@ -1106,7 +1399,8 @@ def create_app(root: Path, initial: tuple[Path, Path] | None = None) -> FastAPI:
     @app.post("/api/jobs/detect")
     def detect(req: DetectRequest, dry: bool = Query(False)) -> dict:
         model = resolve(req.model)
-        if read_model(model / train_rfdetr.MANIFEST) is None:
+        info = read_model(model / train_rfdetr.MANIFEST)
+        if info is None:
             raise HTTPException(400, f"{req.model} is not a trained model")
         video = resolve(req.video)
         if not video.is_file():
@@ -1130,12 +1424,686 @@ def create_app(root: Path, initial: tuple[Path, Path] | None = None) -> FastAPI:
         if req.sample_rate:
             command += ["--sample-rate", f"{req.sample_rate:g}"]
         result = {"detections": rel(out), "video": rel(video)}
+        if req.project:
+            result["project"] = project_or_404(req.project).id
         if dry:
             return job_response(None, command, True, result)
         job = start(
-            "detect", f"Detect {video.name} with {model.name}", command, result
+            "detect", f"Detect {video.name} with {info['name']}", command, result
         )
         return job_response(job, command, False, result)
+
+    # -- Workspace: folders and projects ----------------------------
+
+    # Videos being sampled into a batch: batch id -> progress.
+    ingest: dict[str, dict] = {}
+
+    # Auto-label runs (Label Assist on every image of a batch): batch
+    # id -> progress.
+    autolabel: dict[str, dict] = {}
+
+    def progress_of(batch_id: str) -> dict | None:
+        progress = ingest.get(batch_id)
+        if progress is None:
+            return None
+        return {"done": progress["done"], "total": progress["total"]}
+
+    def autolabel_of(batch_id: str) -> dict | None:
+        run = autolabel.get(batch_id)
+        if run is None:
+            return None
+        return {k: v for k, v in run.items() if k not in ("stop", "thread", "project")}
+
+    def project_or_404(project_id: str) -> Project:
+        try:
+            return ws.project(project_id)
+        except KeyError:
+            raise HTTPException(404, "no such project")
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+
+    def model_count(path: Path) -> int:
+        folder = path / "models"
+        if not folder.is_dir():
+            return 0
+        return sum((c / train_rfdetr.MANIFEST).is_file() for c in folder.iterdir())
+
+    def node_summary(node, nodes: dict) -> dict:
+        base = {
+            "kind": node.kind,
+            "id": node.id,
+            "name": node.meta.get("name", node.path.name),
+            "parent": node.parent,
+            "created": node.meta.get("created"),
+            "updated": node.meta.get("updated"),
+        }
+        if node.kind == "folder":
+            children = [n for n in nodes.values() if n.parent == node.id]
+            return {
+                **base,
+                "folders": sum(n.kind == "folder" for n in children),
+                "projects": sum(n.kind == "project" for n in children),
+            }
+        meta = node.meta
+        # A loaded project's stats are newer than its project.json.
+        stats = meta.get("stats") or {}
+        for project in ws.loaded():
+            if project.id == node.id:
+                stats = project.stats()
+                base["updated"] = project.meta.get("updated", base["updated"])
+        project_type = meta.get("type", "object-detection")
+        return {
+            **base,
+            "type": project_type,
+            "type_name": PROJECT_TYPES.get(project_type, project_type),
+            "stats": stats,
+            "models": model_count(node.path),
+        }
+
+    def folder_line(nodes: dict, folder_id: str | None) -> str:
+        names = []
+        while folder_id and folder_id in nodes:
+            names.append(nodes[folder_id].meta.get("name", ""))
+            folder_id = nodes[folder_id].parent
+        return " / ".join(reversed(names))
+
+    @app.get("/api/ws")
+    def ws_list(folder: str | None = Query(None), q: str = Query("")) -> dict:
+        nodes = ws.nodes()
+        if folder and (folder not in nodes or nodes[folder].kind != "folder"):
+            raise HTTPException(404, "no such folder")
+        query = q.strip().lower()
+        if query:
+            # Search the whole workspace.
+            items = [n for n in nodes.values() if query in n.meta.get("name", "").lower()]
+        else:
+            items = [n for n in nodes.values() if n.parent == (folder or None)]
+        summaries = []
+        for node in items:
+            summary = node_summary(node, nodes)
+            if query:
+                summary["where"] = folder_line(nodes, node.parent)
+            summaries.append(summary)
+        return {
+            "root": str(ws.path),
+            "folder": (
+                {"id": folder, "name": nodes[folder].meta.get("name")} if folder else None
+            ),
+            "trail": ws.breadcrumbs(folder),
+            "folders": [x for x in summaries if x["kind"] == "folder"],
+            "projects": [x for x in summaries if x["kind"] == "project"],
+            "types": PROJECT_TYPES,
+        }
+
+    @app.get("/api/ws/folders")
+    def ws_folders() -> dict:
+        nodes = ws.nodes()
+        folders = [
+            {"id": n.id, "name": n.meta.get("name"), "parent": n.parent,
+             "path": folder_line(nodes, n.id)}
+            for n in nodes.values() if n.kind == "folder"
+        ]
+        folders.sort(key=lambda f: f["path"].lower())
+        return {"folders": folders}
+
+    def ws_error(exc: Exception):
+        if isinstance(exc, KeyError):
+            return HTTPException(404, "not found")
+        return HTTPException(400, str(exc))
+
+    @app.post("/api/ws/folders")
+    def ws_create_folder(req: NodeCreate) -> dict:
+        try:
+            node = ws.create_folder(req.name, req.parent or None)
+        except (KeyError, ValueError, OSError) as exc:
+            raise ws_error(exc)
+        return node_summary(node, ws.nodes())
+
+    @app.post("/api/ws/projects")
+    def ws_create_project(req: NodeCreate) -> dict:
+        try:
+            node = ws.create_project(req.name, req.parent or None, req.type)
+        except (KeyError, ValueError, OSError) as exc:
+            raise ws_error(exc)
+        print(f"Created the project {req.name}")
+        return node_summary(ws.nodes()[node.id], ws.nodes())
+
+    def busy_projects(node_id: str) -> None:
+        """409 if a job (training) is using a project under the node."""
+        nodes = ws.nodes()
+        ids = [node_id] if nodes[node_id].kind == "project" else ws.project_ids_under(node_id)
+        for project_id in ids:
+            job = jobs.using(str(nodes[project_id].path))
+            if job is not None:
+                raise HTTPException(409, f"'{job.title}' is using {nodes[project_id].meta.get('name')}; stop it first")
+            if any(r["project"] == project_id for r in autolabel.values()):
+                raise HTTPException(409, "it is being auto-labeled; stop that first")
+            if any(i.get("project") == project_id for i in ingest.values()):
+                raise HTTPException(409, "a video is still being added to it; wait for it")
+
+    @app.patch("/api/ws/nodes/{node_id}")
+    def ws_update(node_id: str, req: NodeUpdate) -> dict:
+        try:
+            if req.parent is not None:
+                busy_projects(node_id)
+                ws.move(node_id, req.parent or None)
+            if req.name is not None:
+                ws.rename(node_id, req.name)
+        except (KeyError, ValueError, OSError) as exc:
+            raise ws_error(exc)
+        nodes = ws.nodes()
+        return node_summary(nodes[node_id], nodes)
+
+    @app.delete("/api/ws/nodes/{node_id}")
+    def ws_delete(node_id: str) -> dict:
+        nodes = ws.nodes()
+        if node_id not in nodes:
+            raise HTTPException(404, "not found")
+        busy_projects(node_id)
+        gone = set(
+            [node_id] if nodes[node_id].kind == "project" else ws.project_ids_under(node_id)
+        )
+        with lock:
+            for sid in [sid for sid, x in sessions.items()
+                        if x.kind == "project" and x.project.id in gone]:
+                sessions.pop(sid).close()
+        ws.delete(node_id)
+        print(f"Deleted {nodes[node_id].meta.get('name')} ({rel(nodes[node_id].path)})")
+        return {"deleted": node_id}
+
+    # -- A project's dataset
+
+    @app.get("/api/ws/projects/{project_id}")
+    def ws_project(project_id: str) -> dict:
+        project = project_or_404(project_id)
+        nodes = ws.nodes()
+        node = nodes[project_id]
+        counts = project.class_counts()
+        return {
+            **node_summary(node, nodes),
+            "path": rel(project.path),
+            "trail": ws.breadcrumbs(node.parent),
+            "batches": [
+                {
+                    **project.batch_summary(b),
+                    "progress": progress_of(b["id"]),
+                    "autolabeling": autolabel_of(b["id"]),
+                }
+                for b in reversed(project.batches)
+            ],
+            "classes": [{"name": n, "boxes": c} for n, c in counts.items()],
+            "models": project_models(project),
+        }
+
+    @app.get("/api/ws/projects/{project_id}/detections")
+    def ws_detections(project_id: str) -> dict:
+        """The detections files (--save-detections) that belong to a
+        project: made with one of its models, imported into one of its
+        batches, or by a job run from its page. Also the videos under
+        the root, to run a model on."""
+        project = project_or_404(project_id)
+        models_dir = project.models_dir.resolve()
+        imported = {
+            resolve(b["source"]["detections"]): b["name"]
+            for b in project.batches
+            if (b.get("source") or {}).get("detections")
+        }
+        from_jobs = {
+            resolve(j["result"]["detections"])
+            for j in jobs.list()
+            if j["result"].get("project") == project.id and j["result"].get("detections")
+        }
+        found, videos = find_files(root, skip=ws.path)
+        files = []
+        for f in found:
+            path = Path(os.path.abspath(f["path"]))
+            model = None
+            if f.get("weights"):
+                weights = Path(f["weights"]).expanduser().resolve()
+                folder = weights if weights.is_dir() else weights.parent
+                if folder.is_relative_to(models_dir):
+                    info = read_model(folder / train_rfdetr.MANIFEST)
+                    model = info["name"] if info else folder.name
+            batch = imported.get(path)
+            if model is None and batch is None and path not in from_jobs:
+                continue
+            files.append({
+                **{k: f.get(k) for k in ("detector", "source", "samples", "edited", "failed", "classes", "modified")},
+                "path": rel(path),
+                "name": path.name,
+                "video": rel(f["video"]),
+                "model": model,
+                "batch": batch,
+            })
+        return {"files": files, "videos": [rel(v) for v in videos]}
+
+    @app.get("/api/ws/projects/{project_id}/images")
+    def ws_images(
+        project_id: str,
+        batch: str | None = Query(None),
+        status: str | None = Query(None),
+        cls: str | None = Query(None),
+        q: str = Query(""),
+        sort: str = Query("newest"),
+        offset: int = Query(0, ge=0),
+        limit: int = Query(100, ge=1, le=500),
+    ) -> dict:
+        project = project_or_404(project_id)
+        with project.lock:
+            ids = project.batch_images(batch or None)
+            if sort == "newest":
+                ids = ids[::-1]
+            elif sort == "name":
+                ids.sort(key=lambda i: project.images[i]["file_name"].lower())
+            records = [(i, project.images[i]) for i in ids]
+            if status == "empty":
+                records = [(i, r) for i, r in records
+                           if r.get("status") == "labeled" and not r["boxes"]]
+            elif status:
+                records = [(i, r) for i, r in records if r.get("status") == status]
+            if cls:
+                key = normalize_name(cls)
+                records = [(i, r) for i, r in records
+                           if any(normalize_name(b["label"]) == key for b in r["boxes"])]
+            if q.strip():
+                needle = q.strip().lower()
+                records = [(i, r) for i, r in records
+                           if needle in Path(r["file_name"]).name.lower()]
+            page = records[offset:offset + limit]
+            batch_names = {b["id"]: b["name"] for b in project.batches}
+            return {
+                "total": len(records),
+                "offset": offset,
+                "images": [
+                    {
+                        "id": i,
+                        "name": Path(r["file_name"]).name,
+                        "width": r["width"],
+                        "height": r["height"],
+                        "status": r.get("status", "unlabeled"),
+                        "batch": r.get("batch_id"),
+                        "batch_name": batch_names.get(r.get("batch_id")),
+                        "boxes": [
+                            [b["label"], *b["box"], b.get("confidence", 1.0)]
+                            for b in r["boxes"]
+                        ],
+                    }
+                    for i, r in page
+                ],
+            }
+
+    def image_or_404(project: Project, image_id: int) -> None:
+        if image_id not in project.images:
+            raise HTTPException(404, "no such image")
+
+    @app.get("/api/ws/projects/{project_id}/images/{image_id}/thumbnail")
+    def ws_thumbnail(project_id: str, image_id: int) -> Response:
+        project = project_or_404(project_id)
+        image_or_404(project, image_id)
+        try:
+            return image_response(project.thumbnail(image_id))
+        except KeyError:
+            raise HTTPException(404, "cannot read the image")
+
+    @app.get("/api/ws/projects/{project_id}/images/{image_id}/image")
+    def ws_image(project_id: str, image_id: int) -> Response:
+        project = project_or_404(project_id)
+        image_or_404(project, image_id)
+        path = project.image_path(image_id)
+        if not path.is_file():
+            raise HTTPException(404, "the image file is gone")
+        return FileResponse(path, media_type=media_type(path))
+
+    @app.post("/api/ws/projects/{project_id}/images/status")
+    def ws_images_status(project_id: str, req: ImagesStatus) -> dict:
+        project = project_or_404(project_id)
+        if req.status not in STATUSES:
+            raise HTTPException(400, f"unknown status {req.status}")
+        ids = list(req.ids)
+        if req.batch:
+            with project.lock:
+                ids += [
+                    i for i in project.batch_images(req.batch)
+                    if req.from_status in (None, project.images[i].get("status"))
+                ]
+        if not ids:
+            raise HTTPException(400, "no images given")
+        return {"changed": project.set_status(ids, req.status)}
+
+    @app.post("/api/ws/projects/{project_id}/images/delete")
+    def ws_images_delete(project_id: str, req: ImageIds) -> dict:
+        project = project_or_404(project_id)
+        return {"deleted": project.delete_images(req.ids)}
+
+    @app.put("/api/ws/projects/{project_id}/classes")
+    def ws_set_classes(project_id: str, update: ClassesUpdate) -> dict:
+        project = project_or_404(project_id)
+        project.set_classes(update.classes)
+        return {"classes": project.classes()}
+
+    @app.post("/api/ws/projects/{project_id}/classes/rename")
+    def ws_class_rename(project_id: str, req: ClassRename) -> dict:
+        project = project_or_404(project_id)
+        try:
+            project.rename_class(req.old, req.new)
+        except KeyError:
+            raise HTTPException(404, f"no class {req.old}")
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        return {"classes": project.classes()}
+
+    @app.delete("/api/ws/projects/{project_id}/classes")
+    def ws_class_delete(project_id: str, name: str = Query(min_length=1)) -> dict:
+        project = project_or_404(project_id)
+        return {"boxes": project.delete_class(name), "classes": project.classes()}
+
+    @app.post("/api/ws/projects/{project_id}/annotate")
+    def ws_annotate(project_id: str, req: AnnotateRequest) -> dict:
+        """Open the project (or one batch) in the annotator."""
+        project = project_or_404(project_id)
+        try:
+            session = add_session(ProjectSession(project, req.batch or None))
+        except KeyError:
+            raise HTTPException(404, "no such batch")
+        return {"id": session.id}
+
+    # -- Uploads
+
+    @app.post("/api/ws/projects/{project_id}/batches")
+    def ws_create_batch(project_id: str, req: BatchCreate) -> dict:
+        project = project_or_404(project_id)
+        return project.add_batch(req.name, req.kind)
+
+    @app.patch("/api/ws/projects/{project_id}/batches/{batch_id}")
+    def ws_update_batch(project_id: str, batch_id: str, req: BatchUpdate) -> dict:
+        project = project_or_404(project_id)
+        try:
+            return project.update_batch(batch_id, name=req.name.strip())
+        except KeyError:
+            raise HTTPException(404, "no such batch")
+
+    @app.delete("/api/ws/projects/{project_id}/batches/{batch_id}")
+    def ws_delete_batch(project_id: str, batch_id: str) -> dict:
+        project = project_or_404(project_id)
+        # Stop sampling / auto-labeling first; they delete nothing.
+        for runs in (ingest, autolabel):
+            progress = runs.get(batch_id)
+            if progress is not None:
+                progress["stop"].set()
+                progress["thread"].join(timeout=30)
+        try:
+            project.delete_batch(batch_id)
+        except KeyError:
+            raise HTTPException(404, "no such batch")
+        return {"deleted": batch_id}
+
+    # -- Auto label: Label Assist on a whole batch
+
+    @app.get("/api/ws/projects/{project_id}/assist")
+    def ws_assist_sources(project_id: str) -> dict:
+        return assist_choices({}, project_or_404(project_id))
+
+    def run_autolabel(
+        project: Project, batch_id: str, ids: list[int], req: AutoLabelRequest,
+        model: str | None,
+    ) -> None:
+        run = autolabel[batch_id]
+        classes = [(c.name, c.description) for c in req.classes]
+        error = None
+        try:
+            for image_id in ids:
+                if run["stop"].is_set():
+                    break
+                with project.lock:
+                    record = project.images.get(image_id)
+                    labeled = record is None or record.get("status") == "labeled"
+                    path = None if record is None else project.image_path(image_id)
+                if labeled:
+                    # Deleted, or labeled by hand since the run started.
+                    run["skipped"] += 1
+                    continue
+                frame = cv2.imread(str(path))
+                if frame is None:
+                    run["failed"] += 1
+                    continue
+                try:
+                    result = assist.detect(
+                        frame, req.source, model, classes, {}, coco_classes()
+                    )
+                except ValueError as exc:
+                    # A bad choice (class, model): the same on every image.
+                    error = str(exc)
+                    break
+                except AssistError as exc:
+                    run["failed"] += 1
+                    run["last_error"] = str(exc)
+                    if run["failed"] >= 3 and not run["done"]:
+                        # It isn't working at all: don't try every image.
+                        error = str(exc)
+                        break
+                    continue
+                threshold = req.min_confidence
+                if threshold is None:
+                    threshold = result.get("threshold") or 0.0
+                boxes = [b for b in result["boxes"] if b["confidence"] >= threshold]
+                with project.lock:
+                    record = project.images.get(image_id)
+                    if record is None or record.get("status") == "labeled":
+                        run["skipped"] += 1
+                        continue
+                    project.set_boxes(image_id, boxes, status="predicted")
+                run["done"] += 1
+                run["boxes"] += len(boxes)
+                if req.source != "trained":
+                    run["model"] = result.get("model", run["model"])
+        except Exception as exc:  # noqa: BLE001 - reported on the batch
+            error = str(exc)
+        finally:
+            autolabel.pop(batch_id, None)
+            summary = {
+                "source": req.source,
+                "model": run["model"],
+                "classes": [c.name for c in req.classes],
+                "images": run["done"],
+                "boxes": run["boxes"],
+                "failed": run["failed"],
+                "stopped": run["stop"].is_set(),
+                "error": error,
+                "finished": now_iso(),
+            }
+            try:
+                project.update_batch(batch_id, autolabel=summary)
+            except KeyError:
+                pass  # the batch was deleted
+            print(
+                f"Auto-labeled {run['done']} images of {project.name} with "
+                f"{run['model']}: {run['boxes']} boxes"
+                + (f", {run['failed']} failed" if run["failed"] else "")
+                + (f" ({error})" if error else "")
+            )
+
+    @app.post("/api/ws/projects/{project_id}/batches/{batch_id}/autolabel")
+    def ws_autolabel(project_id: str, batch_id: str, req: AutoLabelRequest) -> dict:
+        """Run Label Assist on a batch's images in the background; their
+        boxes are saved as pre-labels (status "predicted") to review."""
+        project = project_or_404(project_id)
+        try:
+            batch = project.batch(batch_id)
+        except KeyError:
+            raise HTTPException(404, "no such batch")
+        if batch_id in autolabel:
+            raise HTTPException(409, "this batch is already being auto-labeled")
+        if batch_id in ingest:
+            raise HTTPException(409, "frames are still being extracted; wait for them")
+        if req.source not in SOURCES:
+            raise HTTPException(400, f"unknown source {req.source}")
+        if not any(c.name.strip() for c in req.classes):
+            raise HTTPException(400, "choose at least one class")
+        model = req.model
+        names = [c.name.strip() for c in req.classes if c.name.strip()]
+        if req.source == "trained":
+            folder = resolve(model or "")
+            info = read_model(folder / train_rfdetr.MANIFEST)
+            if info is None:
+                raise HTTPException(400, f"{model} is not a trained model")
+            known = {normalize_name(c) for c in info["classes"]}
+            if not any(normalize_name(n) in known for n in names):
+                raise HTTPException(
+                    400, f"{info['name']} finds {', '.join(info['classes'])}; choose some of them"
+                )
+            model = str(folder)
+        elif req.source == "rfdetr":
+            coco = {normalize_name(n) for n in coco_classes().values()}
+            unknown = [n for n in names if normalize_name(n) not in coco]
+            if unknown:
+                raise HTTPException(400, f"not COCO classes: {', '.join(unknown)}")
+        wanted = {"unlabeled"} if req.images == "unlabeled" else {"unlabeled", "predicted"}
+        with project.lock:
+            ids = [
+                i for i in project.batch_images(batch_id)
+                if project.images[i].get("status", "unlabeled") in wanted
+            ]
+        if not ids:
+            raise HTTPException(400, "no images to label in this batch")
+        sources = assist.sources({}, [])
+        if req.source != "trained" and not sources[req.source]["available"]:
+            raise HTTPException(400, sources[req.source]["reason"])
+        autolabel[batch_id] = {
+            "project": project.id,
+            "source": req.source,
+            "model": info["name"] if req.source == "trained" else (model or req.source),
+            "total": len(ids),
+            "done": 0,
+            "boxes": 0,
+            "failed": 0,
+            "skipped": 0,
+            "last_error": None,
+            "started": time.time(),
+            "stop": threading.Event(),
+        }
+        thread = threading.Thread(
+            target=run_autolabel,
+            args=(project, batch_id, ids, req, model),
+            daemon=True,
+        )
+        autolabel[batch_id]["thread"] = thread
+        thread.start()
+        print(f"Auto-labeling {len(ids)} images of {batch['name']} ({req.source})")
+        return autolabel_of(batch_id)
+
+    @app.post("/api/ws/projects/{project_id}/batches/{batch_id}/autolabel/stop")
+    def ws_autolabel_stop(project_id: str, batch_id: str) -> dict:
+        project_or_404(project_id)
+        run = autolabel.get(batch_id)
+        if run is None:
+            raise HTTPException(404, "not being auto-labeled")
+        # The image being detected is finished first.
+        run["stop"].set()
+        return {"stopping": batch_id}
+
+    def run_ingest(
+        project: Project, batch_id: str, video: Path, indices: list[int], name: str
+    ) -> None:
+        progress = ingest[batch_id]
+
+        def on_progress(done: int, total: int) -> None:
+            progress["done"] = done
+
+        try:
+            added = sample_video(
+                project, batch_id, video, indices, name=name,
+                on_progress=on_progress, stop=progress["stop"],
+            )
+            if not progress["stop"].is_set():
+                project.update_batch(batch_id, state="ready")
+            print(f"Added {added} frames of {name} to {project.name}")
+        except Exception as exc:  # noqa: BLE001 - reported on the batch
+            print(f"error: sampling {name}: {exc}")
+            try:
+                project.update_batch(batch_id, state="failed", error=str(exc))
+            except KeyError:
+                pass
+        finally:
+            video.unlink(missing_ok=True)
+            ingest.pop(batch_id, None)
+
+    @app.post("/api/ws/projects/{project_id}/batches/{batch_id}/files")
+    async def ws_upload(
+        project_id: str,
+        batch_id: str,
+        request: Request,
+        name: str = Query(min_length=1),
+        rate: float | None = Query(None, gt=0, le=240),
+    ) -> dict:
+        """Add a file sent as the request body to a batch: a picture, or
+        a video whose frames are sampled (`rate` per second, default all)
+        in the background."""
+        project = project_or_404(project_id)
+        try:
+            batch = project.batch(batch_id)
+        except KeyError:
+            raise HTTPException(404, "no such batch")
+        original = Path(name)
+        suffix = original.suffix.lower()
+        if suffix in IMAGE_EXTENSIONS:
+            data = await request.body()
+            frame = decode_image(data)
+            if frame is None:
+                raise HTTPException(400, f"can't read {original.name} as an image")
+            image_id = project.add_image(batch_id, original.name, frame, data)
+            return {"image": image_id}
+        if suffix not in VIDEO_EXTENSIONS:
+            raise HTTPException(
+                400,
+                f"{original.name} is not a picture or a video "
+                f"({', '.join(sorted(IMAGE_EXTENSIONS | VIDEO_EXTENSIONS))})",
+            )
+        if batch.get("kind") != "video" or batch.get("source", {}).get("video"):
+            raise HTTPException(400, "a video goes in a new video batch of its own")
+        # Kept (hidden) until its frames are sampled.
+        uploads = project.path / ".uploads"
+        uploads.mkdir(exist_ok=True)
+        video = uploads / f"{batch_id}{suffix}"
+        try:
+            with video.open("wb") as f:
+                async for chunk in request.stream():
+                    f.write(chunk)
+            info = video_info(video)
+        except (ValueError, OSError):
+            video.unlink(missing_ok=True)
+            raise HTTPException(400, f"can't read {original.name} as a video")
+        indices = sample_indices(info["total_frames"], info["fps"], rate)
+        if not indices:
+            video.unlink(missing_ok=True)
+            raise HTTPException(400, f"{original.name} has no frames")
+        project.update_batch(
+            batch_id,
+            state="processing",
+            source={
+                "video": original.name,
+                "fps": info["fps"],
+                "total_frames": info["total_frames"],
+                "width": info["width"],
+                "height": info["height"],
+                "rate": rate,
+                "frames": len(indices),
+            },
+        )
+        ingest[batch_id] = {
+            "project": project.id,
+            "done": 0,
+            "total": len(indices),
+            "stop": threading.Event(),
+        }
+        thread = threading.Thread(
+            target=run_ingest,
+            args=(project, batch_id, video, indices, original.name),
+            daemon=True,
+        )
+        ingest[batch_id]["thread"] = thread
+        thread.start()
+        print(f"Sampling {len(indices)} frames of {original.name} into {project.name}")
+        return {"frames": len(indices)}
 
     return app
 
@@ -1166,6 +2134,10 @@ def main() -> None:
             "relative paths are resolved against (default: current "
             "directory)."
         ),
+    )
+    p.add_argument(
+        "--workspace",
+        help="Folder of the projects (default: <root>/workspace).",
     )
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8000)
@@ -1203,13 +2175,18 @@ def main() -> None:
                 )
         initial = (video, detections)
 
+    ws = Workspace(
+        Path(args.workspace).resolve() if args.workspace else root / WORKSPACE_DIR
+    )
     try:
-        app = create_app(root, initial)
+        app = create_app(root, initial, ws)
     except ValueError as exc:
         raise SystemExit(f"error: {exc}")
 
     url = f"http://{args.host}:{args.port}"
-    print(f"Annotator: {url}" + ("" if initial else " (choose the files there)"))
+    if initial:
+        url += "/annotate"
+    print(f"Studio: {url}")
     if not args.no_browser:
         threading.Timer(1.0, webbrowser.open, args=(url,)).start()
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")

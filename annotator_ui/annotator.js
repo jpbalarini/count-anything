@@ -51,6 +51,8 @@ const S = {
   clipboard: null,
   filter: 'all',
   playing: false,
+  // Project mode (images of a workspace project): id -> {w, h, name, status}.
+  images: new Map(),
 };
 let nextId = 1;
 
@@ -77,6 +79,20 @@ function iou(a, b) {
   if (w <= 0 || h <= 0) return 0;
   const inter = w * h;
   return inter / (area(a) + area(b) - inter);
+}
+
+// A project's images (vs the frames of a video and its detections file).
+const isProject = () => S.project?.mode === 'project';
+const STATUS_NAMES = { unlabeled: 'Unlabeled', predicted: 'Pre-labeled', labeled: 'Labeled' };
+
+// How a frame is named in the UI: its file name, or index and time.
+function frameLabel(index, short = false) {
+  if (isProject()) {
+    const name = S.images.get(index)?.name ?? `#${index}`;
+    // Keep the end of long names (frame numbers): "7RswKdW…upscale_000123.jpg".
+    return short && name.length > 24 ? `${name.slice(0, 6)}…${name.slice(-15)}` : name;
+  }
+  return `#${index} · ${fmtTime(index)}`;
 }
 
 function fmtTime(index) {
@@ -201,6 +217,7 @@ function markDirty() {
   S.counts.set(index, boxes.length);
   S.failed = false;
   S.edited.add(index);
+  if (isProject()) S.images.get(index).status = 'labeled';
   if (dirtyIndex !== null && dirtyIndex !== index) flushSave();
   dirtyIndex = index;
   clearTimeout(saveTimer);
@@ -496,6 +513,14 @@ async function goTo(pos) {
   S.hover = null;
   const index = curIndex();
   const token = ++loadToken;
+  // A project's images can each have their own size.
+  let resized = false;
+  const size = S.images.get(index);
+  if (size && (size.w !== S.W || size.h !== S.H)) {
+    S.W = size.w;
+    S.H = size.h;
+    resized = true;
+  }
   updateFrameChrome();
   scrollThumbIntoView();
 
@@ -516,7 +541,7 @@ async function goTo(pos) {
   } finally {
     clearTimeout(spin);
   }
-  if (!S.lockView) fitView();
+  if (!S.lockView || resized) fitView();
   updateBanner();
   renderSidebar();
   if (assistOpen()) updateAssistButtons();
@@ -563,7 +588,7 @@ async function togglePlay() {
   // From the last frame, play from the start.
   if (!step(1)) await goTo(0);
   const meta = S.project.meta;
-  const sampleFps = (S.project.fps || 30) / (meta.sample_step || 1);
+  const sampleFps = isProject() ? 4 : (S.project.fps || 30) / (meta.sample_step || 1);
   const delay = 1000 / clamp(sampleFps, 1, 12);
   while (S.playing) {
     const t0 = performance.now();
@@ -1270,11 +1295,24 @@ function renderSidebar() {
 
   // Frame facts
   const index = curIndex();
-  $('#factIndex').textContent = index ?? '–';
-  $('#factTime').textContent = index != null ? fmtTime(index) : '–';
   $('#factSample').textContent = `${S.pos + 1} of ${S.indices.length}`;
-  const st = S.failed ? ['failed', 'Detection failed'] : S.edited.has(index) ? ['edited', 'Edited'] : ['original', 'As detected'];
-  $('#factStatus').innerHTML = `<span class="st ${st[0]}">${st[1]}</span>`;
+  if (isProject()) {
+    const im = S.images.get(index);
+    $('#factIndex').textContent = im ? frameLabel(index, true) : '–';
+    $('#factIndex').title = im?.name ?? '';
+    $('#factTime').textContent = im ? `${im.w}×${im.h}` : '–';
+    const status = im?.status || 'unlabeled';
+    $('#factStatus').innerHTML = `<span class="st ${status}">${STATUS_NAMES[status]}</span>`;
+    $('#approveBtn').hidden = false;
+    $('#approveBtn').innerHTML = status === 'labeled'
+      ? `${icon('right')} Next image to label <kbd>M</kbd>`
+      : `${icon('check')} Mark as labeled &amp; next <kbd>M</kbd>`;
+  } else {
+    $('#factIndex').textContent = index ?? '–';
+    $('#factTime').textContent = index != null ? fmtTime(index) : '–';
+    const st = S.failed ? ['failed', 'Detection failed'] : S.edited.has(index) ? ['edited', 'Edited'] : ['original', 'As detected'];
+    $('#factStatus').innerHTML = `<span class="st ${st[0]}">${st[1]}</span>`;
+  }
   $('#fillPrevBtn').disabled = S.pos <= 0;
   $('#toolFill').disabled = S.pos <= 0;
   $('#toolDup').disabled = !selectedBox();
@@ -1338,15 +1376,16 @@ let thumbEls = [];
 function buildThumbs() {
   const wrap = $('#thumbs');
   wrap.innerHTML = '';
-  const ratio = `${S.W} / ${S.H}`;
   thumbEls = S.indices.map((index, pos) => {
+    const size = S.images.get(index);
+    const ratio = size ? `${size.w} / ${size.h}` : `${S.W} / ${S.H}`;
     const el = document.createElement('button');
     el.className = 'thumb';
     el.dataset.pos = pos;
     el.innerHTML = `<span class="thumb-img" style="aspect-ratio:${ratio}">`
       + `<img loading="lazy" decoding="async" alt="" src="/api/frames/${index}/thumbnail?${sq()}">`
       + `<span class="thumb-badge"></span><span class="thumb-check">${icon('check')}</span></span>`
-      + `<span class="thumb-label">#${index} · ${fmtTime(index)}</span>`;
+      + `<span class="thumb-label" title="${esc(frameLabel(index))}">${esc(frameLabel(index, true))}</span>`;
     el.addEventListener('click', () => goTo(pos));
     wrap.append(el);
     return el;
@@ -1363,6 +1402,12 @@ function updateThumb(index) {
   badge.textContent = n < 0 ? 'failed' : `${n} box${n === 1 ? '' : 'es'}`;
   badge.classList.toggle('failed', n < 0);
   el.classList.toggle('edited', S.edited.has(index));
+  if (isProject()) {
+    const status = S.images.get(index)?.status;
+    if (status === 'unlabeled' && !n) badge.textContent = 'unlabeled';
+    badge.classList.toggle('predicted', status === 'predicted');
+    badge.classList.toggle('unlabeled', status === 'unlabeled');
+  }
 }
 
 function applyFilter() {
@@ -1370,12 +1415,16 @@ function applyFilter() {
   let shown = 0;
   S.indices.forEach((index, pos) => {
     const n = S.counts.get(index);
+    const status = S.images.get(index)?.status;
     const ok = {
       all: true,
       edited: S.edited.has(index),
       unedited: !S.edited.has(index),
       empty: n === 0,
       failed: n < 0,
+      unlabeled: status === 'unlabeled',
+      predicted: status === 'predicted',
+      todo: status !== 'labeled',
     }[S.filter];
     thumbEls[pos].hidden = !ok;
     if (ok) shown++;
@@ -1428,8 +1477,11 @@ function drawTimeline() {
       tctx.fillStyle = '#e11d48';
       tctx.fillRect(x, base - 10, Math.max(1, bw - (bw > 3 ? 1 : 0)), 10);
     } else {
-      const h = Math.max(c ? 2 : 0, (c / max) * (base - 6));
-      tctx.fillStyle = S.edited.has(index) ? cssVar('--accent') : cssVar('--accent-line');
+      const status = S.images.get(index)?.status;
+      const h = Math.max(c || status === 'unlabeled' ? 2 : 0, (c / max) * (base - 6));
+      tctx.fillStyle = status === 'predicted' ? '#f59e0b'
+        : status === 'unlabeled' ? '#d1d5db'
+          : S.edited.has(index) ? cssVar('--accent') : cssVar('--accent-line');
       tctx.fillRect(x, base - h, Math.max(1, bw - (bw > 3 ? 1 : 0)), h);
     }
   });
@@ -1456,7 +1508,9 @@ tl.addEventListener('pointermove', (e) => {
   const c = S.counts.get(index);
   const tip = $('#tlTip');
   tip.hidden = false;
-  tip.textContent = `#${index} · ${fmtTime(index)} · ${c < 0 ? 'failed' : `${c} boxes`}${S.edited.has(index) ? ' · edited' : ''}`;
+  tip.textContent = isProject()
+    ? `${frameLabel(index)} · ${c} boxes · ${STATUS_NAMES[S.images.get(index)?.status] || ''}`
+    : `${frameLabel(index)} · ${c < 0 ? 'failed' : `${c} boxes`}${S.edited.has(index) ? ' · edited' : ''}`;
   const r = tl.getBoundingClientRect();
   tip.style.left = `${clamp(e.clientX - r.left, 60, r.width - 60)}px`;
   if (tlDrag && pos !== S.pos) goTo(pos);
@@ -1612,6 +1666,7 @@ function wireUi() {
   });
   $('#filterSelect').addEventListener('change', (e) => { applyFilter(); e.target.blur(); });
   $('#playBtn').addEventListener('click', togglePlay);
+  $('#approveBtn').addEventListener('click', approve);
 
   new ResizeObserver(() => { resizeCanvas(); if (S.view.fitted) fitView(); }).observe(stage);
   new ResizeObserver(() => drawTimeline()).observe(tl);
@@ -1698,7 +1753,8 @@ window.addEventListener('keydown', (e) => {
     case 'e': toggle('hideAll'); break;
     case 'f': fitView(); break;
     case 'p': togglePlay(); break;
-    case 't': openTrain(T.jobs.some((j) => j.status === 'running') ? 'jobs' : 'new'); break;
+    case 'm': approve(); break;
+    case 't': trainAction(); break;
   }
 });
 
@@ -1823,8 +1879,7 @@ async function openSelected() {
     if (S.project && !stale) await flushSave();
     await api('/api/open', { method: 'POST', body: { detections, video: video || null } });
     // Start the page over on the new files.
-    history.replaceState(null, '', '/');
-    location.reload();
+    location.href = '/annotate';
   } catch (err) {
     showPickerError(err.message);
     btn.disabled = false;
@@ -2445,15 +2500,14 @@ async function openFiles(detections, video) {
   try {
     if (S.project && !stale) await flushSave();
     await api('/api/open', { method: 'POST', body: { detections, video } });
-    history.replaceState(null, '', '/');
-    location.reload();
+    location.href = '/annotate';
   } catch (err) {
     toast(err.message);
   }
 }
 
 function wireTrain() {
-  $('#trainBtn').addEventListener('click', () => openTrain('new'));
+  $('#trainBtn').addEventListener('click', trainAction);
   $('#jobPill').addEventListener('click', () => openTrain('jobs'));
   $('#trainClose').addEventListener('click', closeTrain);
   $('#trainCancel').addEventListener('click', closeTrain);
@@ -3030,6 +3084,74 @@ function wireAssist() {
 }
 
 // ------------------------------------------------------------------
+// Project mode: approving images, back to the project
+// ------------------------------------------------------------------
+
+// Mark the current image labeled (its boxes as they are: saving them
+// does it), then go to the next image that isn't.
+async function approve() {
+  if (!isProject() || !S.loaded) return;
+  const index = curIndex();
+  if (S.images.get(index)?.status !== 'labeled') {
+    markDirty();
+    flushSave();
+  }
+  const next = S.indices.findIndex((i, pos) => pos > S.pos && S.images.get(i)?.status !== 'labeled');
+  const wrap = S.indices.findIndex((i, pos) => pos < S.pos && S.images.get(i)?.status !== 'labeled');
+  if (next >= 0) goTo(next);
+  else if (wrap >= 0) { toast('Back to the first image still to label'); goTo(wrap); }
+  else { toast('Every image here is labeled', 3500); renderSidebar(); }
+}
+
+const projectUrl = (section) => `/#/p/${S.project.project.id}/${section}`;
+
+function trainAction() {
+  if (isProject()) {
+    flushSave().finally(() => { location.href = projectUrl('train'); });
+    return;
+  }
+  openTrain(T.jobs.some((j) => j.status === 'running') ? 'jobs' : 'new');
+}
+
+// A "back" arrow left of the title (saving first).
+function addBackLink(href, title) {
+  const back = document.createElement('a');
+  back.className = 'icon-btn';
+  back.href = href;
+  back.title = title;
+  back.innerHTML = icon('arrow-left');
+  back.addEventListener('click', (e) => {
+    e.preventDefault();
+    flushSave().finally(() => { location.href = back.href; });
+  });
+  $('.file-head').prepend(back);
+}
+
+// The page of a project's batch: header, filters and labels.
+function setupProjectMode(p) {
+  for (const [id, w, h, name, status] of p.images) S.images.set(id, { w, h, name, status });
+  const title = p.project.name;
+  document.title = `${title} · Annotate`;
+  $('#fileName').textContent = title;
+  $('#fileName').title = title;
+  $('#fileSub').textContent = `${p.batch ? p.batch.name : 'All images'} · ${p.frames.length} image${p.frames.length === 1 ? '' : 's'}`;
+  $('#fileSub').title = p.batch ? p.batch.name : '';
+  // The open-files button becomes "back to the project".
+  addBackLink(projectUrl('annotate'), `Back to ${title}`);
+  $('#openBtn').hidden = true;
+  $('#groupLine').innerHTML = `Batch: <b>${esc(p.batch ? p.batch.name : 'all images')}</b>`;
+  $('#trainBtn').title = 'Train a model on this project (T)';
+  for (const [dt, text] of [['#dtIndex', 'File'], ['#dtTime', 'Size'], ['#dtSample', 'Image']]) $(dt).textContent = text;
+  $('#filterSelect').innerHTML = '<option value="all">All images</option><option value="todo">Still to label</option>'
+    + '<option value="unlabeled">Unlabeled</option><option value="predicted">Pre-labeled</option>'
+    + '<option value="edited">Labeled</option><option value="empty">No boxes</option>';
+  $('#legendEdited').lastChild.textContent = 'labeled';
+  $('#legendFailed').innerHTML = '<i class="sw sw-pred"></i>pre-labeled';
+  $('#keyApprove').hidden = false;
+  $('#rightHead').textContent = 'Images';
+}
+
+// ------------------------------------------------------------------
 // Start
 // ------------------------------------------------------------------
 
@@ -3040,7 +3162,22 @@ async function init() {
   wireAssist();
   let p;
   try {
-    p = await api('/api/project');
+    // ?project=ID[&batch=ID]: open that project's images;
+    // ?detections=PATH[&video=PATH]: open a detections file; ?s=ID: the
+    // files another page opened; none: the newest open files.
+    // &from=ID: a detections file opened from that project's page.
+    const params = new URLSearchParams(location.search);
+    let sid = params.get('s');
+    if (params.get('detections')) {
+      sid = (await api('/api/open', {
+        method: 'POST', body: { detections: params.get('detections'), video: params.get('video') || null },
+      })).id;
+    } else if (params.get('project')) {
+      sid = (await api(`/api/ws/projects/${encodeURIComponent(params.get('project'))}/annotate`, {
+        method: 'POST', body: { batch: params.get('batch') || null },
+      })).id;
+    }
+    p = await api(`/api/project${sid ? `?s=${sid}` : ''}`);
   } catch (err) {
     $('#toolAssist').disabled = true;
     if (err.status === 409) {
@@ -3065,15 +3202,21 @@ async function init() {
   S.classes = [...p.classes];
   S.activeClass = S.classes[0] || null;
 
-  document.title = `${p.detections} · Annotator`;
-  $('#fileName').textContent = p.detections;
-  $('#fileName').title = p.detections_path;
-  const sampleStep = p.meta.sample_step || 1;
-  const rate = sampleStep > 1 ? `${+(p.fps / sampleStep).toFixed(2)} samples/s` : 'every frame';
-  $('#fileSub').textContent = `${p.video} · ${p.width}×${p.height} · ${rate}`;
-  $('#fileSub').title = p.video_path;
-  if (p.warnings.length) setTimeout(() => toast(`The detections file doesn't match this video: ${p.warnings.join(', ')}`), 600);
-  $('#detectorName').textContent = p.meta.detector || 'unknown';
+  if (p.mode === 'project') {
+    setupProjectMode(p);
+  } else {
+    document.title = `${p.detections} · Annotator`;
+    $('#fileName').textContent = p.detections;
+    $('#fileName').title = p.detections_path;
+    const sampleStep = p.meta.sample_step || 1;
+    const rate = sampleStep > 1 ? `${+(p.fps / sampleStep).toFixed(2)} samples/s` : 'every frame';
+    $('#fileSub').textContent = `${p.video} · ${p.width}×${p.height} · ${rate}`;
+    $('#fileSub').title = p.video_path;
+    if (p.warnings.length) setTimeout(() => toast(`The detections file doesn't match this video: ${p.warnings.join(', ')}`), 600);
+    $('#detectorName').textContent = p.meta.detector || 'unknown';
+    const from = new URLSearchParams(location.search).get('from');
+    if (from) addBackLink(`/#/p/${encodeURIComponent(from)}/detections`, 'Back to the project');
+  }
   $('#suggestionList').innerHTML = (p.suggestions || []).map((c) => `<option value="${esc(c)}">`).join('');
 
   S.showLabels = pref('showLabels') ?? false;
@@ -3094,11 +3237,15 @@ async function init() {
 
   if (!S.indices.length) {
     $('#banner').hidden = false;
-    $('#banner').textContent = 'The detections file has no frames.';
+    $('#banner').textContent = isProject() ? 'There are no images here yet.' : 'The detections file has no frames.';
     return;
   }
   const m = location.hash.match(/f=(\d+)/);
-  const wanted = m ? Number(m[1]) : pref(`pos:${p.detections_path}`);
+  let wanted = m ? Number(m[1]) : pref(`pos:${p.detections_path}`);
+  if (!m && isProject() && (!S.images.has(wanted) || S.images.get(wanted).status === 'labeled')) {
+    // Opening a batch: start where the work is.
+    wanted = S.indices.find((i) => S.images.get(i).status !== 'labeled') ?? wanted;
+  }
   const start = Math.max(0, S.indices.indexOf(wanted));
   await goTo(start);
 }

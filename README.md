@@ -270,6 +270,66 @@ virtual, nothing is written to disk for them.
   rendering.
 - The file opens in standard COCO tools (e.g. `pycocotools`).
 
+## Projects: upload, label, train (AI Studio)
+
+    python annotate_server.py            # http://127.0.0.1:8000
+
+The home page is a workspace of **folders** and **projects** (like
+Roboflow's). A folder holds folders and projects; drag a card onto a folder
+(or onto the breadcrumb above) to move it, or use its ⋮ menu (rename, move,
+delete). The search box searches every folder. A project is a dataset of
+images and the models trained on it:
+
+- **Upload**: drop pictures, videos or whole folders. Pictures go in as one
+  batch; each video is its own batch, cut into frames at the rate you pick
+  (1 frame every 2 s up to every frame; the page shows how many images that
+  makes). Frames are extracted in the background. Everything arrives
+  **unlabeled**.
+- **Annotate**: the batches, with how many images are labeled,
+  **pre-labeled** (boxes from a model, not checked yet) and unlabeled. A
+  batch opens in the same annotator as detections files
+  (`/annotate?project=ID&batch=ID`, see below), starting at the first image
+  still to label. Saving any change to an image marks it labeled; `M` (or
+  "Mark as labeled & next") accepts an image as it is, which is how
+  pre-labels are reviewed. The batch's ⋮ menu can accept all its pre-labels
+  at once.
+- **Auto label** (on a batch): runs one of Label Assist's detectors
+  (locate-anything, Claude, the stock RF-DETR, or a trained model) on every
+  unlabeled image of the batch, or also on the pre-labeled ones, in the
+  background. What it finds, above a minimum confidence (default: the
+  detector's own threshold), is saved as pre-labels to review. Images you
+  labeled are never changed, even ones labeled while it runs. The batch
+  shows its progress and a **Stop** button (it stops after the current
+  image; what was found so far is kept).
+- **Dataset**: every image with its boxes, filtered by status, batch, class
+  or file name. Click an image to open it in the annotator, ⌘-click (or the
+  corner check) to select several and mark them labeled / unlabeled or
+  delete them.
+- **Classes**: box counts per class; rename a class (into an existing one to
+  merge them) or delete it with its boxes.
+- **Train**: fine-tunes RF-DETR on the project (`train_rfdetr.py --project`),
+  on its labeled images only, or also on the pre-labeled ones (their boxes of
+  at least a minimum confidence). Unlabeled images are never used.
+- **Models**: the project's models with their scores (mAP per epoch, F1 at
+  the chosen threshold), and the training in progress. Label Assist's
+  **Trained** tab offers them first, to pre-label the next images.
+- **Detections**: run one of the project's models on a video (any video
+  under `--root`, or one you upload) to get a detections file
+  (`process_video.py --weights ... --no-render`, saved next to the video).
+  The project's detections files are listed (made with its models, or
+  imported into it): **Open** reviews one in the annotator (below), and
+  **Render command** copies the `process_video.py --load-detections`
+  command that renders the video from it.
+
+Everything is plain files in `workspace/` (`--workspace` to put it
+elsewhere): a folder is a directory with `folder.json`; a project is a
+directory with `project.json`, `annotations.json` (COCO, plus each image's
+`batch_id` and `status`), `images/`, `thumbs/` and `models/`.
+
+Train from the command line on a project:
+
+    python train_rfdetr.py --project workspace/highway --only-edited
+
 ## Fix the detections by hand (annotation UI)
 
 A web UI (FastAPI) to review and correct a detections file before
@@ -280,12 +340,14 @@ re-rendering: move, resize, relabel, add and delete boxes, frame by frame.
     python annotate_server.py input.mp4 dets.json
     python process_video.py input.mp4 --load-detections dets.json ...
 
-The UI opens on http://127.0.0.1:8000. Its file picker (folder button, or
-`⌘O`) lists the detections files under `--root` (default: the current
-directory), newest first, each matched to the video named in its
-`videos[0].file_name`. Pick one, or type the paths (relative to `--root` or
-absolute) when the video isn't found. Opening other files in one tab makes
-the other tabs stop saving instead of writing into the wrong file.
+A project's **Detections** page opens its files here; any other file opens
+at http://127.0.0.1:8000/annotate. Its file picker (folder button, or `⌘O`) lists the detections files under
+`--root` (default: the current directory; the workspace isn't searched),
+newest first, each matched to the video named in its `videos[0].file_name`.
+Pick one, or type the paths (relative to `--root` or absolute) when the
+video isn't found. Each tab edits the files it opened; when many are opened
+the oldest tab's files are closed, and that tab stops saving instead of
+writing into the wrong file.
 
 - Every change is saved to `dets.json` right away (the first change keeps the
   untouched file as `dets.orig.json`). Re-render with `--load-detections`.
@@ -308,7 +370,7 @@ the other tabs stop saving instead of writing into the wrong file.
   id in `rfdetr` files), and changed frames get `"edited": true` on their
   image.
 
-Options: `--root`, `--port`, `--host`, `--no-browser`.
+Options: `--root`, `--workspace`, `--port`, `--host`, `--no-browser`.
 
 ### Label Assist: find objects with a model
 

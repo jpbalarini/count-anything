@@ -18,6 +18,10 @@ Consecutive frames of a video are nearly identical, so frames are split
 into train / valid in contiguous stretches of each video rather than at
 random; otherwise the validation score would mostly measure how well
 the model remembers the frame next to it.
+
+build_project_dataset does the same from a project of the annotator's
+workspace (workspace.py): its labeled (and pre-labeled) images, split
+in stretches of each batch.
 """
 
 from __future__ import annotations
@@ -307,25 +311,7 @@ def build_dataset(
     if empty:
         log(f"warning: no boxes of {', '.join(empty)} in the chosen frames")
 
-    now = datetime.now().astimezone().isoformat(timespec="seconds")
-    categories = [
-        {"id": i + 1, "name": name, "supercategory": "none"}
-        for i, name in enumerate(class_names)
-    ]
-    for split in SPLITS:
-        document = {
-            "info": {
-                "description": f"{split} split, built from detections",
-                "date_created": now,
-            },
-            "licenses": [],
-            "categories": categories,
-            **coco[split],
-        }
-        (out / split / "_annotations.coco.json").write_text(
-            json.dumps(document, separators=(",", ":"))
-        )
-
+    now = _write_splits(out, coco, class_names, "detections")
     summary = {
         "created": now,
         "classes": class_names,
@@ -344,6 +330,183 @@ def build_dataset(
             "val_fraction": val_fraction,
             "every": every,
             "only_edited": only_edited,
+            "image_size": image_size or None,
+        },
+    }
+    (out / MARKER).write_text(json.dumps(summary, indent=2))
+    return summary
+
+
+def _write_splits(
+    out: Path, coco: dict, class_names: list[str], built_from: str
+) -> str:
+    """Write each split's _annotations.coco.json; returns the time."""
+    now = datetime.now().astimezone().isoformat(timespec="seconds")
+    categories = [
+        {"id": i + 1, "name": name, "supercategory": "none"}
+        for i, name in enumerate(class_names)
+    ]
+    for split in SPLITS:
+        document = {
+            "info": {
+                "description": f"{split} split, built from {built_from}",
+                "date_created": now,
+            },
+            "licenses": [],
+            "categories": categories,
+            **coco[split],
+        }
+        (out / split / "_annotations.coco.json").write_text(
+            json.dumps(document, separators=(",", ":"))
+        )
+    return now
+
+
+def build_project_dataset(
+    project_dir: Path,
+    out: Path,
+    *,
+    classes: list[str] | None = None,
+    min_score: float = DEFAULT_MIN_SCORE,
+    val_fraction: float = DEFAULT_VAL_FRACTION,
+    every: int = 1,
+    only_labeled: bool = False,
+    image_size: int | None = DEFAULT_IMAGE_SIZE,
+    on_progress: Callable[[int, int], None] | None = None,
+    log: Callable[[str], None] = print,
+) -> dict:
+    """Like build_dataset, from a workspace project (workspace.py).
+
+    - Unlabeled images are left out (nothing says what is on them).
+      Labeled images are used with all their boxes; predicted ones
+      (boxes from a model, not reviewed) only with the boxes of at
+      least `min_score`, and not at all with `only_labeled`.
+    - Each batch is split into train / valid in contiguous stretches,
+      as the frames of a video are by build_dataset.
+    """
+    from workspace import load_dataset_images
+
+    if not 0 < val_fraction <= 0.5:
+        raise ValueError("the validation fraction must be in (0, 0.5]")
+    if every < 1:
+        raise ValueError("every must be >= 1")
+    project_classes, batches, images = load_dataset_images(project_dir)
+    wanted_status = {"labeled"} if only_labeled else {"labeled", "predicted"}
+    usable = [im for im in images if im.get("status") in wanted_status]
+
+    def kept(image: dict) -> list[dict]:
+        if image["status"] == "labeled":
+            return image["boxes"]
+        return [b for b in image["boxes"] if b.get("confidence", 1.0) >= min_score]
+
+    # Classes: the requested ones, or every class with a box to learn.
+    used: dict[str, str] = {}
+    for name in project_classes:
+        used.setdefault(normalize_name(name), name)
+    counts: dict[str, int] = {}
+    for image in usable:
+        for item in kept(image):
+            key = normalize_name(item["label"])
+            used.setdefault(key, item["label"])
+            counts[key] = counts.get(key, 0) + 1
+    if classes:
+        class_names, missing = [], []
+        for name in classes:
+            key = normalize_name(name)
+            if counts.get(key):
+                if used[key] not in class_names:
+                    class_names.append(used[key])
+            elif name.strip():
+                missing.append(name.strip())
+        if missing:
+            log(f"warning: no boxes of {', '.join(missing)} on the images to train on")
+    else:
+        class_names = [name for key, name in used.items() if counts.get(key)]
+    if not class_names:
+        raise ValueError(
+            "no boxes to learn from"
+            + (" on the labeled images" if only_labeled else "")
+            + "; label some images first"
+        )
+    category_of = {normalize_name(n): i + 1 for i, n in enumerate(class_names)}
+
+    # Which image goes where: each batch split in stretches.
+    plan: list[tuple[dict, str]] = []
+    by_batch: dict[str, list[dict]] = {}
+    for image in usable:
+        by_batch.setdefault(image.get("batch_id"), []).append(image)
+    for batch_images in by_batch.values():
+        batch_images = batch_images[::every]
+        plan += [
+            (image, split_of(pos, len(batch_images), val_fraction))
+            for pos, image in enumerate(batch_images)
+        ]
+    if not plan:
+        raise ValueError("no images to train on")
+    if not any(split == "valid" for _, split in plan):
+        plan[-1] = (plan[-1][0], "valid")
+    duplicate_valid = not any(split == "train" for _, split in plan)
+    if duplicate_valid:
+        log("warning: a single image: it is used to train and to validate")
+
+    prepare_output(out)
+    for split in SPLITS:
+        (out / split).mkdir()
+    coco = {split: {"images": [], "annotations": []} for split in SPLITS}
+    per_class = {name: 0 for name in class_names}
+    names_by_batch = {b["id"]: b.get("name") for b in batches}
+    for done, (image, split) in enumerate(plan, start=1):
+        frame = cv2.imread(str(image["path"]))
+        if frame is None:
+            log(f"warning: cannot read {image['path']}, skipped")
+            continue
+        height, width = frame.shape[:2]
+        out_w, out_h = inference_size(width, height, image_size or None)
+        if (out_w, out_h) != (width, height):
+            frame = cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_AREA)
+        scale = np.array([out_w / width, out_h / height] * 2)
+        file_name = f"{image['id']:06d}_{_slug(Path(image['file_name']).stem)}.jpg"
+        splits = SPLITS if duplicate_valid else (split,)
+        for target in splits:
+            cv2.imwrite(
+                str(out / target / file_name), frame,
+                [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY],
+            )
+            _add_image(
+                coco[target], file_name, out_w, out_h,
+                [dict(b, confidence=1.0) for b in kept(image)],
+                category_of, scale, 0.0,
+                per_class if target == splits[0] else None,
+                class_names,
+            )
+        if on_progress is not None:
+            on_progress(done, len(plan))
+
+    empty = [name for name, n in per_class.items() if n == 0]
+    if empty:
+        log(f"warning: no boxes of {', '.join(empty)} in the chosen images")
+    now = _write_splits(out, coco, class_names, "a project")
+    status_counts: dict[str, int] = {}
+    for image, _ in plan:
+        status_counts[image["status"]] = status_counts.get(image["status"], 0) + 1
+    summary = {
+        "created": now,
+        "classes": class_names,
+        "project": str(project_dir),
+        "sources": [
+            {"batch": batch_id, "name": names_by_batch.get(batch_id),
+             "frames": len(items[::every])}
+            for batch_id, items in by_batch.items()
+        ],
+        "status": status_counts,
+        "images": {s: len(coco[s]["images"]) for s in SPLITS},
+        "boxes": {s: len(coco[s]["annotations"]) for s in SPLITS},
+        "boxes_per_class": per_class,
+        "options": {
+            "min_score": min_score,
+            "val_fraction": val_fraction,
+            "every": every,
+            "only_labeled": only_labeled,
             "image_size": image_size or None,
         },
     }
