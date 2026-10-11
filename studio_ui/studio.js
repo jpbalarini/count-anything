@@ -399,7 +399,7 @@ async function newProject(parent) {
 // Home: folders and projects
 // ------------------------------------------------------------------
 
-const H = { folder: null, data: null, q: '', sort: pref('sort') || 'updated', seq: 0 };
+const H = { folder: null, data: null, q: '', sort: pref('sort') || 'updated', seq: 0, loc: null };
 
 const SORTS = {
   updated: ['Date edited', (a, b) => (b.updated || '').localeCompare(a.updated || '')],
@@ -428,7 +428,9 @@ async function showHome(folderId) {
       <div class="toolbar">
         <label class="search">${icon('search')}<input id="homeSearch" placeholder="Search all projects and folders" autocomplete="off" spellcheck="false"></label>
         <label class="select-label">Sort <select class="select" id="homeSort">${Object.entries(SORTS).map(([k, [label]]) => `<option value="${k}">${label}</option>`).join('')}</select></label>
+        <button class="btn btn-ghost btn-sm loc-btn" id="locBtn" title="Where projects are kept on disk" hidden>${icon('folder')}<span class="mono" id="locPath"></span></button>
       </div>
+      <div id="locNotice"></div>
       <div id="homeBody"><div class="grid"><div class="skeleton" style="height:140px"></div><div class="skeleton" style="height:140px"></div><div class="skeleton" style="height:140px"></div></div></div>
     </div>`;
     $('#homeSearch').value = H.q;
@@ -441,8 +443,79 @@ async function showHome(folderId) {
       timer = setTimeout(() => { H.q = e.target.value; loadHome(); }, 180);
     });
     $('#homeSort').addEventListener('change', (e) => { H.sort = e.target.value; pref('sort', H.sort); renderHomeBody(); });
+    $('#locBtn').addEventListener('click', changeLocation);
+    loadLocation();
   }
   await loadHome();
+}
+
+// -- Projects location (where the workspace is on disk)
+
+const tilde = (path) => {
+  const home = H.loc?.home;
+  return home && (path === home || path.startsWith(`${home}/`)) ? `~${path.slice(home.length)}` : path;
+};
+
+async function loadLocation() {
+  try { H.loc = await api('/api/ws/location'); } catch { return; /* older server */ }
+  renderLocation();
+}
+
+function renderLocation() {
+  const loc = H.loc;
+  if (!loc || !$('#locBtn')) return;
+  $('#locBtn').hidden = false;
+  $('#locPath').textContent = tilde(loc.path);
+  $('#locNotice').innerHTML = loc.source === 'legacy'
+    ? `<div class="callout warn" style="margin:-8px 0 20px">${icon('alert')}<div style="flex:1">Your projects are kept inside the app's own folder (<span class="mono">${esc(tilde(loc.path))}</span>). Pick a folder of your own, so they stay safe when the app is updated or moved.</div><button class="btn btn-sm" id="locFix">Choose location</button></div>`
+    : '';
+  $('#locFix')?.addEventListener('click', changeLocation);
+}
+
+async function changeLocation() {
+  const loc = H.loc;
+  if (!loc) return;
+  if (loc.source === 'flag') {
+    await dialog({
+      title: 'Projects location',
+      okText: 'OK',
+      render: (body) => { body.innerHTML = `<p style="margin:0">Projects are kept in <span class="mono">${esc(tilde(loc.path))}</span>, set by <span class="mono">--workspace</span> when the server was started. Restart it without that option to pick the location here.</p>`; },
+      onOk: () => true,
+    });
+    return;
+  }
+  const hasProjects = !!(H.data && (H.data.folders.length || H.data.projects.length || H.folder));
+  const suggested = loc.source === 'legacy' ? tilde(loc.default) : tilde(loc.path);
+  const result = await dialog({
+    title: 'Projects location',
+    okText: 'Use this folder',
+    render: (body) => {
+      body.innerHTML = `<p style="margin:0 0 14px;color:var(--muted)">Now: <span class="mono">${esc(tilde(loc.path))}</span></p>`
+        + `<label class="field"><span>Folder</span><input class="input mono" name="path" value="${esc(suggested)}" autofocus autocomplete="off" spellcheck="false" placeholder="~/Documents/Projects"></label>`
+        + `<div class="hint" style="color:var(--muted);font-size:12.5px;margin:6px 0 16px">A full path; <span class="mono">~</span> is your home folder. It is created if it doesn't exist.</div>`
+        + `<div class="radio-cards">`
+        + `<label class="radio-card${hasProjects ? ' on' : ''}"><input type="radio" name="mode" value="move" ${hasProjects ? 'checked' : ''}><div><b>Move my projects there</b><small>Every folder and project goes along, with its images and models.</small></div></label>`
+        + `<label class="radio-card${hasProjects ? '' : ' on'}"><input type="radio" name="mode" value="switch" ${hasProjects ? '' : 'checked'}><div><b>Only switch to that folder</b><small>Shows the projects already there. The current ones stay where they are.</small></div></label></div>`;
+      for (const r of body.querySelectorAll('[name=mode]')) {
+        r.addEventListener('change', () => {
+          for (const c of body.querySelectorAll('.radio-card')) c.classList.toggle('on', c.querySelector('input').checked);
+        });
+      }
+    },
+    onOk: (body) => {
+      let path = body.querySelector('[name=path]').value.trim();
+      if (!path) throw new Error('Enter a folder.');
+      if (path === '~' || path.startsWith('~/')) path = loc.home + path.slice(1);
+      const move = body.querySelector('[name=mode]:checked').value === 'move';
+      return api('/api/ws/location', { method: 'PUT', body: { path, move } });
+    },
+  });
+  if (!result) return;
+  H.loc = result;
+  renderLocation();
+  toast(result.moved ? `Moved ${plural(result.moved, 'folder or project', 'folders and projects')} to ${tilde(result.path)}` : `Projects are now kept in ${tilde(result.path)}`);
+  if (H.folder && !result.moved) location.hash = '#/';
+  else await loadHome();
 }
 
 async function loadHome() {

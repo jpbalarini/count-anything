@@ -24,7 +24,9 @@ for the frame being edited with a cloud, local or trained model
 
 The home page (/) is the workspace (workspace.py): folders and projects,
 each project a dataset of uploaded pictures and video frames, labeled
-in the same annotator (/annotate?project=ID) and trained on.
+in the same annotator (/annotate?project=ID) and trained on. Where they
+are kept is picked on the home page (saved in workspace.CONFIG_FILE),
+unless --workspace is given.
 """
 
 from __future__ import annotations
@@ -71,8 +73,8 @@ from rfdetr_detector import MODEL_SIZES, WEIGHTS_FILE
 from workspace import (
     IMAGE_EXTENSIONS,
     PROJECT_TYPES,
+    DEFAULT_LOCATION,
     STATUSES,
-    WORKSPACE_DIR,
     Project,
     Workspace,
     decode_image,
@@ -82,7 +84,9 @@ from workspace import (
     now_iso,
     sample_indices,
     sample_video,
+    save_location,
     video_info,
+    workspace_location,
 )
 
 # ANTHROPIC_API_KEY / LOCATE_ANYTHING_* for Label Assist, as in
@@ -866,6 +870,12 @@ class NodeUpdate(BaseModel):
     parent: str | None = None
 
 
+class LocationUpdate(BaseModel):
+    path: str = Field(min_length=1)
+    # Take the current folders and projects along (else just switch).
+    move: bool = False
+
+
 class BatchCreate(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     kind: str = Field(pattern="^(images|video)$")
@@ -910,9 +920,17 @@ def create_app(
     root: Path,
     initial: tuple[Path, Path] | None = None,
     workspace: Workspace | None = None,
+    location_source: str = "flag",
 ) -> FastAPI:
+    """`location_source` says where `workspace` came from (see
+    workspace_location; "flag" for --workspace, which the UI can't
+    change)."""
     root = root.resolve()
-    ws = workspace or Workspace(root / WORKSPACE_DIR)
+    if workspace is None:
+        path, location_source = workspace_location(root)
+        workspace = Workspace(path)
+    ws = workspace
+    location = {"source": location_source}
     # Open annotator sessions by id, oldest first.
     sessions: OrderedDict[str, Session | ProjectSession] = OrderedDict()
     lock = threading.Lock()
@@ -1603,6 +1621,42 @@ def create_app(
             if any(i.get("project") == project_id for i in ingest.values()):
                 raise HTTPException(409, "a video is still being added to it; wait for it")
 
+    @app.get("/api/ws/location")
+    def ws_location() -> dict:
+        return {
+            "path": str(ws.path),
+            "source": location["source"],
+            "default": str(DEFAULT_LOCATION),
+            "home": str(Path.home()),
+        }
+
+    @app.put("/api/ws/location")
+    def ws_set_location(req: LocationUpdate) -> dict:
+        if location["source"] == "flag":
+            raise HTTPException(409, "set by --workspace; restart without it to change it here")
+        path = Path(req.path.strip()).expanduser()
+        if not path.is_absolute():
+            raise HTTPException(400, "enter a full path, like ~/Documents/Projects")
+        if jobs.running() is not None:
+            raise HTTPException(409, f"'{jobs.running().title}' is running; wait for it or stop it first")
+        if autolabel:
+            raise HTTPException(409, "a batch is being auto-labeled; stop that first")
+        if ingest:
+            raise HTTPException(409, "a video is still being added to a project; wait for it")
+        try:
+            moved = ws.relocate(path, req.move)
+        except (ValueError, OSError) as exc:
+            raise HTTPException(400, str(exc))
+        if not req.move:
+            # Their projects aren't in this workspace any more.
+            with lock:
+                for sid in [sid for sid, x in sessions.items() if x.kind == "project"]:
+                    sessions.pop(sid).close()
+        save_location(ws.path)
+        location["source"] = "settings"
+        print(f"Projects location: {ws.path}" + (f" ({moved} moved there)" if moved else ""))
+        return {**ws_location(), "moved": moved}
+
     @app.patch("/api/ws/nodes/{node_id}")
     def ws_update(node_id: str, req: NodeUpdate) -> dict:
         try:
@@ -2175,7 +2229,10 @@ def main() -> None:
     )
     p.add_argument(
         "--workspace",
-        help="Folder of the projects (default: <root>/workspace).",
+        help=(
+            "Folder of the projects, for this run (default: the one "
+            "picked on the home page, else ~/.count-anything)."
+        ),
     )
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8000)
@@ -2213,11 +2270,14 @@ def main() -> None:
                 )
         initial = (video, detections)
 
-    ws = Workspace(
-        Path(args.workspace).resolve() if args.workspace else root / WORKSPACE_DIR
-    )
+    if args.workspace:
+        path, source = Path(args.workspace).expanduser().resolve(), "flag"
+    else:
+        path, source = workspace_location(root)
+    ws = Workspace(path)
+    print(f"Projects: {path}")
     try:
-        app = create_app(root, initial, ws)
+        app = create_app(root, initial, ws, source)
     except ValueError as exc:
         raise SystemExit(f"error: {exc}")
 

@@ -3,7 +3,7 @@
 A folder holds folders and projects; a project holds a dataset of
 images (uploaded pictures, and frames sampled from uploaded videos),
 their boxes, and the models trained on them. Everything is plain files
-under one directory (default: <root>/workspace):
+under one directory, the projects location (see workspace_location):
 
     workspace/
       hand-tracking/                 a folder
@@ -54,7 +54,15 @@ import numpy as np
 
 from options import normalize_name
 
+# Where projects used to be kept: <root>/workspace, next to the code.
 WORKSPACE_DIR = "workspace"
+# The projects location picked in the UI is saved here.
+CONFIG_FILE = (
+    Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    / "ai-studio" / "config.json"
+)
+# The projects location until one is picked.
+DEFAULT_LOCATION = Path.home() / ".count-anything"
 FOLDER_FILE = "folder.json"
 PROJECT_FILE = "project.json"
 DATASET_FILE = "annotations.json"
@@ -115,6 +123,36 @@ def write_json(path: Path, data: dict, indent: int | None = 2) -> None:
     separators = None if indent else (",", ":")
     tmp.write_text(json.dumps(data, indent=indent, separators=separators))
     os.replace(tmp, path)
+
+
+def saved_location() -> Path | None:
+    """The projects location picked in the UI, if any."""
+    path = (read_json(CONFIG_FILE) or {}).get("workspace")
+    return Path(path).expanduser() if isinstance(path, str) and path else None
+
+
+def save_location(path: Path) -> None:
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    config = read_json(CONFIG_FILE) or {}
+    config["workspace"] = str(path)
+    write_json(CONFIG_FILE, config)
+
+
+def workspace_location(root: Path) -> tuple[Path, str]:
+    """Where the projects are (without --workspace), and why:
+    "settings" (picked in the UI), "legacy" (<root>/workspace, which
+    already has folders or projects, until another location is picked)
+    or "default" (DEFAULT_LOCATION)."""
+    saved = saved_location()
+    if saved is not None:
+        return saved, "settings"
+    legacy = root / WORKSPACE_DIR
+    try:
+        if any(c.is_dir() and not c.name.startswith(".") for c in legacy.iterdir()):
+            return legacy, "legacy"
+    except OSError:
+        pass
+    return DEFAULT_LOCATION, "default"
 
 
 def encode_jpeg(frame: np.ndarray, quality: int) -> bytes:
@@ -876,8 +914,45 @@ class Workspace:
             destination = self.folder_path(parent)
             self._move_dir(node, unique_child(destination, node.path.name))
 
-    def _move_dir(self, node: Node, target: Path) -> None:
-        os.replace(node.path, target)
+    def relocate(self, path: Path, move: bool) -> int:
+        """Use the folder `path` (made if missing) from now on. With
+        `move`, the folders and projects of the current one go there
+        too (renamed if the name is taken), and the current folder is
+        removed if that empties it; without, projects loaded from the
+        current folder are forgotten. Returns how many were moved."""
+        path = Path(os.path.abspath(path.expanduser()))
+        with self.lock:
+            if path == self.path:
+                return 0
+            if path.is_relative_to(self.path):
+                raise ValueError("the new location can't be inside the current one")
+            if path.exists() and not path.is_dir():
+                raise ValueError(f"{path} is a file")
+            self.flush()
+            path.mkdir(parents=True, exist_ok=True)
+            moved = 0
+            if move:
+                top = [n for n in self.nodes().values() if n.parent is None]
+                for node in top:
+                    try:
+                        self._move_dir(node, unique_child(path, node.path.name), shutil.move)
+                    except OSError as exc:
+                        raise ValueError(
+                            f"moved {moved} of {len(top)}, then {node.path.name} "
+                            f"failed ({exc}); the rest are still in {self.path}"
+                        )
+                    moved += 1
+                try:
+                    self.path.rmdir()
+                except OSError:
+                    pass  # Not empty: other files were kept there.
+            else:
+                self._projects.clear()
+            self.path = path
+            return moved
+
+    def _move_dir(self, node: Node, target: Path, mover=os.replace) -> None:
+        mover(node.path, target)
         # Loaded projects (open in the annotator) follow.
         for project in self._projects.values():
             try:

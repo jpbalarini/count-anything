@@ -327,14 +327,21 @@ images and the models trained on it:
   **Render command** copies the `process_video.py --load-detections`
   command that renders the video from it.
 
-Everything is plain files in `workspace/` (`--workspace` to put it
-elsewhere): a folder is a directory with `folder.json`; a project is a
-directory with `project.json`, `annotations.json` (COCO, plus each image's
-`batch_id` and `status`), `images/`, `thumbs/` and `models/`.
+Everything is plain files in the **projects location**, a folder outside
+the code: `~/.count-anything` until you pick another one with the folder
+button on the home page (saved in `~/.config/ai-studio/config.json`). Picking
+one either moves your folders and projects there or only switches to it
+(showing what is already there). `--workspace` sets it for one run instead.
+Projects made before this lived in `<root>/workspace`; that folder keeps
+being used, with a notice on the home page, until you pick a location.
+
+A folder is a directory with `folder.json`; a project is a directory with
+`project.json`, `annotations.json` (COCO, plus each image's `batch_id` and
+`status`), `images/`, `thumbs/` and `models/`.
 
 Train from the command line on a project:
 
-    python train_rfdetr.py --project workspace/highway --only-edited
+    python train_rfdetr.py --project ~/.count-anything/highway --only-edited
 
 ## Fix the detections by hand (annotation UI)
 

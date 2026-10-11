@@ -96,7 +96,7 @@ Several files, only the frames fixed by hand, one class, every 2nd frame:
 
 A project of the annotator (the model goes to the project's models/):
 
-    python train_rfdetr.py --project workspace/highway --only-edited
+    python train_rfdetr.py --project ~/.count-anything/highway --only-edited
 """
 
 
