@@ -301,10 +301,16 @@ images and the models trained on it:
   labeled are never changed, even ones labeled while it runs. The batch
   shows its progress and a **Stop** button (it stops after the current
   image; what was found so far is kept).
-- **Dataset**: every image with its boxes, filtered by status, batch, class
-  or file name. Click an image to open it in the annotator, ⌘-click (or the
-  corner check) to select several and mark them labeled / unlabeled or
-  delete them.
+- **Tags**: free-text notes on an image ("one hand", "blurry", "odd
+  angle"), added in the annotator's Frame panel (`G` to type one, Enter to
+  add). Spelling differences in case or `_`/`-` count as the same tag.
+  Tagging doesn't change whether an image is labeled, nor what is trained
+  on. The annotator's images filter lists them too.
+- **Dataset**: every image with its boxes and tags, filtered by status,
+  batch, class, tag (or "No tags") or file name. Click an image to open it
+  in the annotator, a tag to show the images that have it, ⌘-click (or the
+  corner check) to select several and mark them labeled / unlabeled, add
+  or remove a tag, or delete them.
 - **Classes**: box counts per class; rename a class (into an existing one to
   merge them) or delete it with its boxes.
 - **Train**: fine-tunes RF-DETR on the project (`train_rfdetr.py --project`),

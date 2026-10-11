@@ -26,7 +26,8 @@ annotations.json is a COCO detection file, plus:
    "source": {...}}. `state` is "ready", or "processing" while frames
   are being sampled from a video ("interrupted" if the server stopped
   in the middle; the frames sampled so far are kept).
-- per image: `batch_id`, `status` and, for video frames, `frame_id`.
+- per image: `batch_id`, `status`, `tags` (free text, e.g. "one hand",
+  "blurry"; optional) and, for video frames, `frame_id`.
   `status` is "unlabeled" (no boxes yet), "predicted" (boxes from a
   model, not reviewed) or "labeled" (saved or approved by hand).
 - per annotation: `score` (1.0 for boxes drawn by hand).
@@ -63,6 +64,7 @@ THUMBS_DIR = "thumbs"
 MODELS_DIR = "models"
 
 STATUSES = ("unlabeled", "predicted", "labeled")
+MAX_TAG_LENGTH = 60
 PROJECT_TYPES = {"object-detection": "Object Detection"}
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 
@@ -335,6 +337,69 @@ class Project:
                 for item in record["boxes"]:
                     counts[item["label"]] = counts.get(item["label"], 0) + 1
             return counts
+
+    # -- Tags (free-text notes on images, to filter the dataset by)
+
+    def tag_counts(self) -> dict[str, int]:
+        """Every tag with its number of images, most used first."""
+        with self.lock:
+            counts: dict[str, int] = {}
+            for record in self.images.values():
+                for tag in record.get("tags") or []:
+                    counts[tag] = counts.get(tag, 0) + 1
+            return dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0].lower())))
+
+    def _canonical_tag(self, tag: str, known: dict[str, str]) -> str | None:
+        """`tag` cleaned up and spelled like the same tag already used
+        (case and `_`/`-` don't matter), or None if empty."""
+        tag = " ".join(tag.split())[:MAX_TAG_LENGTH]
+        if not tag:
+            return None
+        return known.setdefault(normalize_name(tag), tag)
+
+    def _known_tags(self) -> dict[str, str]:
+        return {normalize_name(t): t for t in self.tag_counts()}
+
+    def set_tags(self, image_id: int, tags: list[str]) -> list[str]:
+        """Replace an image's tags (its status doesn't change)."""
+        with self.lock:
+            record = self.images[image_id]
+            known = self._known_tags()
+            cleaned: list[str] = []
+            for tag in tags:
+                tag = self._canonical_tag(tag, known)
+                if tag and tag not in cleaned:
+                    cleaned.append(tag)
+            if cleaned:
+                record["tags"] = cleaned
+            else:
+                record.pop("tags", None)
+            self.save_soon()
+            return cleaned
+
+    def edit_tags(self, image_ids: list[int], add: list[str], remove: list[str]) -> int:
+        """Add / remove tags on many images; returns how many changed."""
+        with self.lock:
+            known = self._known_tags()
+            add = [t for t in (self._canonical_tag(t, known) for t in add) if t]
+            gone = {normalize_name(t) for t in remove}
+            changed = 0
+            for image_id in image_ids:
+                record = self.images.get(image_id)
+                if record is None:
+                    continue
+                before = list(record.get("tags") or [])
+                after = [t for t in before if normalize_name(t) not in gone]
+                after += [t for t in add if t not in after]
+                if after != before:
+                    changed += 1
+                    if after:
+                        record["tags"] = after
+                    else:
+                        record.pop("tags", None)
+            if changed:
+                self.save_soon()
+            return changed
 
     # -- Paths
 

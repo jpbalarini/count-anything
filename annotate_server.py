@@ -578,9 +578,11 @@ class ProjectSession:
                 # [id, width, height, file name, status] per image.
                 "images": [
                     [i, r["width"], r["height"], Path(r["file_name"]).name,
-                     r.get("status", "unlabeled")]
+                     r.get("status", "unlabeled"), r.get("tags") or []]
                     for i, r in images
                 ],
+                # Every tag of the project, for suggestions.
+                "tags": list(project.tag_counts()),
             }
 
     def close(self) -> None:
@@ -885,6 +887,16 @@ class ImageIds(BaseModel):
     ids: list[int] = Field(min_length=1)
 
 
+class TagsUpdate(BaseModel):
+    tags: list[str] = Field(max_length=50)
+
+
+class TagsEdit(BaseModel):
+    ids: list[int] = Field(min_length=1)
+    add: list[str] = []
+    remove: list[str] = []
+
+
 class ClassRename(BaseModel):
     old: str = Field(min_length=1)
     new: str = Field(min_length=1)
@@ -1048,6 +1060,16 @@ def create_app(
         session = current(s)
         frame_or_404(session, index)
         return {"index": index, **session.save(index, update.boxes)}
+
+    @app.put("/api/frames/{index}/tags")
+    def put_tags(index: int, update: TagsUpdate, s: str | None = Query(None)) -> dict:
+        """Tag an image of a project (detections files have no tags)."""
+        session = current(s)
+        if session.kind != "project":
+            raise HTTPException(400, "only a project's images have tags")
+        frame_or_404(session, index)
+        tags = session.project.set_tags(index, update.tags)
+        return {"index": index, "tags": tags, "all": list(session.project.tag_counts())}
 
     @app.put("/api/classes")
     def put_classes(update: ClassesUpdate, s: str | None = Query(None)) -> dict:
@@ -1632,6 +1654,7 @@ def create_app(
                 for b in reversed(project.batches)
             ],
             "classes": [{"name": n, "boxes": c} for n, c in counts.items()],
+            "tags": [{"name": n, "images": c} for n, c in project.tag_counts().items()],
             "models": project_models(project),
         }
 
@@ -1683,6 +1706,8 @@ def create_app(
         batch: str | None = Query(None),
         status: str | None = Query(None),
         cls: str | None = Query(None),
+        # A tag, or "__none" for images without tags.
+        tag: str | None = Query(None),
         q: str = Query(""),
         sort: str = Query("newest"),
         offset: int = Query(0, ge=0),
@@ -1705,6 +1730,12 @@ def create_app(
                 key = normalize_name(cls)
                 records = [(i, r) for i, r in records
                            if any(normalize_name(b["label"]) == key for b in r["boxes"])]
+            if tag == "__none":
+                records = [(i, r) for i, r in records if not r.get("tags")]
+            elif tag:
+                key = normalize_name(tag)
+                records = [(i, r) for i, r in records
+                           if any(normalize_name(t) == key for t in r.get("tags") or [])]
             if q.strip():
                 needle = q.strip().lower()
                 records = [(i, r) for i, r in records
@@ -1721,6 +1752,7 @@ def create_app(
                         "width": r["width"],
                         "height": r["height"],
                         "status": r.get("status", "unlabeled"),
+                        "tags": r.get("tags") or [],
                         "batch": r.get("batch_id"),
                         "batch_name": batch_names.get(r.get("batch_id")),
                         "boxes": [
@@ -1769,6 +1801,12 @@ def create_app(
         if not ids:
             raise HTTPException(400, "no images given")
         return {"changed": project.set_status(ids, req.status)}
+
+    @app.post("/api/ws/projects/{project_id}/images/tags")
+    def ws_images_tags(project_id: str, req: TagsEdit) -> dict:
+        project = project_or_404(project_id)
+        changed = project.edit_tags(req.ids, req.add, req.remove)
+        return {"changed": changed, "tags": list(project.tag_counts())}
 
     @app.post("/api/ws/projects/{project_id}/images/delete")
     def ws_images_delete(project_id: str, req: ImageIds) -> dict:

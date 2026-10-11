@@ -1096,8 +1096,11 @@ function batchCard(b) {
   } else {
     progress = b.images ? stackBar(b) + legend(b) : '';
   }
-  el.innerHTML = `<div class="cover-img">${b.cover != null ? `<img loading="lazy" alt="" src="${thumbUrl(P.id, b.cover)}">` : icon(b.kind === 'video' ? 'film' : 'images')}</div>`
-    + `<div class="binfo"><div class="bname"><h3 title="${esc(b.name)}">${esc(b.name)}</h3>${kind}${state}</div>`
+  // The cover and the name open the batch in the annotator (once it has images).
+  const href = b.images ? annotateUrl(P.id, b.id) : null;
+  const cover = b.cover != null ? `<img loading="lazy" alt="" src="${thumbUrl(P.id, b.cover)}">` : icon(b.kind === 'video' ? 'film' : 'images');
+  el.innerHTML = (href ? `<a class="cover-img" href="${href}" title="Open in the annotator">${cover}</a>` : `<div class="cover-img">${cover}</div>`)
+    + `<div class="binfo"><div class="bname"><h3 title="${esc(b.name)}">${href ? `<a href="${href}">${esc(b.name)}</a>` : esc(b.name)}</h3>${kind}${state}</div>`
     + `<div class="meta">${batchMeta(b)}</div>${progress}</div>`
     + `<div class="bactions">${batchAction(b)}<button class="icon-btn" data-menu title="More">${icon('more')}</button></div>`;
   el.querySelector('[data-act=autolabel]')?.addEventListener('click', () => autoLabelDialog(b));
@@ -1314,9 +1317,9 @@ function renderAnnotate() {
 // ------------------------------------------------------------------
 
 const DS = {
-  status: '', batch: '', cls: '', q: '', sort: 'newest', page: 0, per: pref('per') || 100,
+  status: '', batch: '', cls: '', tag: '', q: '', sort: 'newest', page: 0, per: pref('per') || 100,
   show: pref('showBoxes') ?? true, selected: new Set(), data: null, seq: 0,
-  reset() { Object.assign(this, { status: '', batch: '', cls: '', q: '', page: 0, selected: new Set(), data: null }); },
+  reset() { Object.assign(this, { status: '', batch: '', cls: '', tag: '', q: '', page: 0, selected: new Set(), data: null }); },
 };
 
 function renderDataset() {
@@ -1332,6 +1335,7 @@ function renderDataset() {
       <label class="search">${icon('search')}<input id="dsSearch" placeholder="Search by file name" value="${esc(DS.q)}" autocomplete="off" spellcheck="false"></label>
       <select class="select" id="dsBatch"><option value="">All batches</option>${d.batches.map((b) => `<option value="${b.id}">${esc(b.name)}</option>`).join('')}</select>
       <select class="select" id="dsClass"><option value="">All classes</option>${d.classes.map((c) => `<option value="${esc(c.name)}">${esc(c.name)} (${fmtInt(c.boxes)})</option>`).join('')}<option value="" disabled>──</option><option value="__empty">Labeled, no boxes</option></select>
+      <select class="select" id="dsTag" title="Tags added to images in the annotator"><option value="">All tags</option>${d.tags.map((t) => `<option value="${esc(t.name)}">${esc(t.name)} (${fmtInt(t.images)})</option>`).join('')}<option value="" disabled>──</option><option value="__none">No tags</option></select>
       <select class="select" id="dsSort"><option value="newest">Newest first</option><option value="oldest">Oldest first</option><option value="name">File name</option></select>
       <span class="grow"></span>
       <label class="toggle"><input type="checkbox" id="dsShow" ${DS.show ? 'checked' : ''}><span class="knob"></span> Show annotations</label>
@@ -1343,6 +1347,9 @@ function renderDataset() {
   $('#dsBatch').value = DS.batch;
   $('#dsClass').value = DS.cls === '' && DS.status === 'empty' ? '__empty' : DS.cls;
   $('#dsSort').value = DS.sort;
+  if (DS.tag && DS.tag !== '__none' && !d.tags.some((t) => t.name === DS.tag)) DS.tag = '';
+  $('#dsTag').value = DS.tag;
+  $('#dsTag').addEventListener('change', (e) => { DS.tag = e.target.value; DS.page = 0; loadImages(); });
   for (const b of $$('[data-status]')) {
     b.addEventListener('click', () => { DS.status = b.dataset.status; DS.page = 0; DS.selected.clear(); renderDataset(); });
   }
@@ -1365,6 +1372,7 @@ async function loadImages() {
   if (DS.status) q.set('status', DS.status);
   if (DS.batch) q.set('batch', DS.batch);
   if (DS.cls) q.set('cls', DS.cls);
+  if (DS.tag) q.set('tag', DS.tag);
   if (DS.q.trim()) q.set('q', DS.q.trim());
   try {
     const data = await api(`/api/ws/projects/${P.id}/images?${q}`);
@@ -1411,7 +1419,11 @@ function renderGrid() {
       + `<span class="pick">${icon('check')}</span>`
       + `<span class="st"><i class="sw ${img.status}"></i>${STATUS_NAMES[img.status]}</span>`
       + (img.boxes.length ? `<span class="count">${img.boxes.length}</span>` : '')
-      + `</div><div class="name" title="${esc(img.name)}">${esc(midTrim(img.name))}</div>`;
+      + `</div><div class="name" title="${esc(img.name)}">${esc(midTrim(img.name))}</div>`
+      + (img.tags.length ? `<div class="tile-tags">${img.tags.map((t) => `<button type="button" class="tag-pill" data-tag="${esc(t)}" title="Show the images tagged “${esc(t)}”">${esc(t)}</button>`).join('')}</div>` : '');
+    for (const b of tile.querySelectorAll('[data-tag]')) {
+      b.addEventListener('click', () => { DS.tag = b.dataset.tag; DS.page = 0; renderDataset(); });
+    }
     const toggleSel = () => {
       if (DS.selected.has(img.id)) DS.selected.delete(img.id); else DS.selected.add(img.id);
       tile.classList.toggle('selected', DS.selected.has(img.id));
@@ -1437,6 +1449,7 @@ function renderSelbar() {
     + `<button class="btn btn-sm" data-act="all">Select page</button>`
     + `<button class="btn btn-sm" data-act="labeled">${icon('check-circle', 'sm')} Mark labeled</button>`
     + `<button class="btn btn-sm" data-act="unlabeled">Mark unlabeled</button>`
+    + `<button class="btn btn-sm" data-act="tag">${icon('tag', 'sm')} Tag…</button>`
     + `<button class="btn btn-sm danger" data-act="delete">${icon('trash', 'sm')} Delete</button>`
     + `<button class="icon-btn" data-act="clear" title="Clear the selection" style="color:#fff">${icon('x')}</button></div>`;
   bar.querySelector('[data-act=all]').addEventListener('click', () => { for (const i of DS.data.images) DS.selected.add(i.id); renderGrid(); });
@@ -1451,6 +1464,7 @@ function renderSelbar() {
       } catch (err) { toast(err.message); }
     });
   }
+  bar.querySelector('[data-act=tag]').addEventListener('click', () => tagSelected());
   bar.querySelector('[data-act=delete]').addEventListener('click', async () => {
     if (!await confirmDialog('Delete images?', `<p>Delete ${plural(n, 'image')} and their boxes from the project?</p><p class="muted">This can't be undone.</p>`)) return;
     try {
@@ -1460,6 +1474,41 @@ function renderSelbar() {
       await refreshProject();
     } catch (err) { toast(err.message); }
   });
+}
+
+// Add a tag to the selected images, or take one off them.
+async function tagSelected() {
+  const n = DS.selected.size;
+  let mode = 'add';
+  const r = await dialog({
+    title: `Tag ${plural(n, 'image')}`,
+    okText: 'Apply',
+    render: (body) => {
+      body.innerHTML = `<div class="radio-cards">`
+        + `<label class="radio-card on"><input type="radio" name="mode" value="add" checked><div><b>Add a tag</b><small>To every selected image</small></div></label>`
+        + `<label class="radio-card"><input type="radio" name="mode" value="remove"><div><b>Remove a tag</b><small>From the selected images that have it</small></div></label></div>`
+        + `<label class="field"><span>Tag</span><input class="input" name="tag" list="tagSuggest" placeholder="e.g. one hand" autofocus autocomplete="off" spellcheck="false" maxlength="60"></label>`
+        + `<datalist id="tagSuggest">${P.data.tags.map((t) => `<option value="${esc(t.name)}">`).join('')}</datalist>`;
+      for (const radio of body.querySelectorAll('[name=mode]')) {
+        radio.addEventListener('change', () => {
+          mode = radio.value;
+          for (const c of body.querySelectorAll('.radio-card')) c.classList.toggle('on', c.querySelector('input').checked);
+        });
+      }
+    },
+    onOk: async (body) => {
+      const tag = body.querySelector('[name=tag]').value.trim();
+      if (!tag) throw new Error('Enter a tag.');
+      return api(`/api/ws/projects/${P.id}/images/tags`, {
+        method: 'POST',
+        body: { ids: [...DS.selected], add: mode === 'add' ? [tag] : [], remove: mode === 'remove' ? [tag] : [] },
+      }).then((res) => ({ ...res, tag }));
+    },
+  });
+  if (!r) return;
+  toast(`${mode === 'add' ? 'Tagged' : 'Untagged'} ${plural(r.changed, 'image')}${mode === 'add' ? ` “${r.tag}”` : ''}`);
+  DS.selected.clear();
+  await refreshProject();
 }
 
 function renderPager() {

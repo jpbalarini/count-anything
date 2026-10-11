@@ -491,6 +491,9 @@ a.card:hover, .card.clickable:hover { border-color: #cfd5df; box-shadow: var(--s
 .bcard .binfo { flex: 1; min-width: 0; }
 .bcard .bname { display: flex; align-items: center; gap: 8px; }
 .bcard .bname h3 { margin: 0; font-size: 15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bcard .bname h3 a:hover { color: var(--accent-2); text-decoration: underline; text-underline-offset: 3px; }
+.bcard a.cover-img { transition: opacity .12s, box-shadow .12s; }
+.bcard a.cover-img:hover { opacity: .88; box-shadow: 0 0 0 2px var(--accent); }
 .bcard .meta { color: var(--muted); font-size: 13px; margin-top: 2px; }
 .bcard .stack { max-width: 520px; }
 .bcard .bactions { display: flex; align-items: center; gap: 6px; }
@@ -584,6 +587,13 @@ a.card:hover, .card.clickable:hover { border-color: #cfd5df; box-shadow: var(--s
 .tile.selected .pick { background: var(--accent); border-color: var(--accent); }
 .tile .pick .ic { width: 14px; height: 14px; opacity: 0; }
 .tile.selected .pick .ic { opacity: 1; }
+.tile-tags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: -2px; }
+.tag-pill {
+  font-size: 11.5px; font-weight: 550; color: #6d28d9; background: #f3edff;
+  border: 1px solid #ddd0fb; border-radius: 999px; padding: 0 8px; height: 20px;
+  max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.tag-pill:hover { background: #e9ddff; }
 .tile .name { font-size: 12.5px; color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .pager-row {
   display: flex; align-items: center; gap: 12px;

@@ -74,6 +74,11 @@
 
       <div class="tab-body" id="classesTab">
         <ul class="class-list" id="classList"></ul>
+        <form class="add-class" id="addClassForm" autocomplete="off">
+          <input id="addClassInput" placeholder="Add a class…" list="suggestionList" spellcheck="false">
+          <button class="btn btn-outline btn-sm" type="submit"><svg class="ic"><use href="#i-plus"/></svg> Add</button>
+          <datalist id="suggestionList"></datalist>
+        </form>
         <div class="unused">
           <div class="unused-title">Unused Classes</div>
           <ul class="unused-list" id="unusedList"></ul>
@@ -108,11 +113,16 @@
       <button class="btn btn-primary approve-btn" id="approveBtn" hidden title="Keep the boxes as they are and go to the next image to label (M)"></button>
     </section>
 
-    <form class="add-class" id="addClassForm" autocomplete="off">
-      <input id="addClassInput" placeholder="Add class…" list="suggestionList">
-      <button class="btn btn-primary" type="submit"><svg class="ic"><use href="#i-plus"/></svg> Add</button>
-      <datalist id="suggestionList"></datalist>
-    </form>
+    <!-- Tags of the image (project images only), always at hand -->
+    <section class="panel tag-panel" id="tagBox" hidden>
+      <div class="tag-head"><span class="panel-subtitle">Tags</span><kbd title="Press G to type a tag">G</kbd></div>
+      <div class="tag-chips" id="tagChips"></div>
+      <form id="tagForm" class="tag-form" autocomplete="off">
+        <svg class="ic"><use href="#i-tag"/></svg>
+        <input id="tagInput" placeholder="Tag this image, e.g. one hand" list="tagList" spellcheck="false" maxlength="60" title="A note on this image to find it again, e.g. “one hand”, “blurry”">
+        <datalist id="tagList"></datalist>
+      </form>
+    </section>
   </aside>
 
   <!-- ============ Canvas ============ -->
@@ -304,6 +314,7 @@
         <p><kbd>P</kbd><span>Play / pause</span></p>
         <p><kbd>R</kbd><span>Fill in missing boxes from previous frame</span></p>
         <p id="keyApprove" hidden><kbd>M</kbd><span>Mark as labeled, go to the next image to label</span></p>
+        <p id="keyTag" hidden><kbd>G</kbd><span>Tag this image</span></p>
         <p><kbd>I</kbd><span>Label Assist: find objects with a model</span></p>
         <p><kbd>O</kbd><span>Ghost of previous frame's boxes</span></p>
       </div>

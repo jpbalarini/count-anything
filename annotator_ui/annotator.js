@@ -53,6 +53,7 @@ const S = {
   playing: false,
   // Project mode (images of a workspace project): id -> {w, h, name, status}.
   images: new Map(),
+  allTags: [],            // every tag of the project, most used first
 };
 let nextId = 1;
 
@@ -1304,6 +1305,7 @@ function renderSidebar() {
     const status = im?.status || 'unlabeled';
     $('#factStatus').innerHTML = `<span class="st ${status}">${STATUS_NAMES[status]}</span>`;
     $('#approveBtn').hidden = false;
+    renderTags();
     $('#approveBtn').innerHTML = status === 'labeled'
       ? `${icon('right')} Next image to label <kbd>M</kbd>`
       : `${icon('check')} Mark as labeled &amp; next <kbd>M</kbd>`;
@@ -1384,7 +1386,7 @@ function buildThumbs() {
     el.dataset.pos = pos;
     el.innerHTML = `<span class="thumb-img" style="aspect-ratio:${ratio}">`
       + `<img loading="lazy" decoding="async" alt="" src="/api/frames/${index}/thumbnail?${sq()}">`
-      + `<span class="thumb-badge"></span><span class="thumb-check">${icon('check')}</span></span>`
+      + `<span class="thumb-tags"></span><span class="thumb-badge"></span><span class="thumb-check">${icon('check')}</span></span>`
       + `<span class="thumb-label" title="${esc(frameLabel(index))}">${esc(frameLabel(index, true))}</span>`;
     el.addEventListener('click', () => goTo(pos));
     wrap.append(el);
@@ -1407,16 +1409,19 @@ function updateThumb(index) {
     if (status === 'unlabeled' && !n) badge.textContent = 'unlabeled';
     badge.classList.toggle('predicted', status === 'predicted');
     badge.classList.toggle('unlabeled', status === 'unlabeled');
+    const tags = S.images.get(index)?.tags || [];
+    el.querySelector('.thumb-tags').innerHTML = tags.map((t) => `<span title="${esc(t)}">${esc(t)}</span>`).join('');
   }
 }
 
 function applyFilter() {
   S.filter = $('#filterSelect').value;
   let shown = 0;
+  const tag = S.filter.startsWith('tag:') ? norm(S.filter.slice(4)) : null;
   S.indices.forEach((index, pos) => {
     const n = S.counts.get(index);
     const status = S.images.get(index)?.status;
-    const ok = {
+    const ok = tag != null ? (S.images.get(index)?.tags || []).some((t) => norm(t) === tag) : {
       all: true,
       edited: S.edited.has(index),
       unedited: !S.edited.has(index),
@@ -1754,6 +1759,7 @@ window.addEventListener('keydown', (e) => {
     case 'f': fitView(); break;
     case 'p': togglePlay(); break;
     case 'm': approve(); break;
+    case 'g': if (isProject()) { e.preventDefault(); $('#tagInput').focus(); } break;
     case 't': trainAction(); break;
   }
 });
@@ -3127,9 +3133,82 @@ function addBackLink(href, title) {
   $('.file-head').prepend(back);
 }
 
+// Tags: free-text notes on a project's image ("one hand", "blurry") to
+// filter the dataset by. They don't change whether it is labeled.
+function renderTags() {
+  if (!isProject()) return;
+  const index = curIndex();
+  const tags = S.images.get(index)?.tags || [];
+  $('#tagChips').innerHTML = tags.map((t, i) => `<span class="tag-chip">${esc(t)}<button type="button" data-untag="${i}" title="Remove the tag">${icon('x')}</button></span>`).join('');
+  $('#tagList').innerHTML = S.allTags.filter((t) => !tags.some((x) => norm(x) === norm(t))).map((t) => `<option value="${esc(t)}">`).join('');
+}
+
+// The frames filter lists the tags in use.
+function renderTagFilter() {
+  const sel = $('#filterSelect');
+  sel.querySelector('optgroup')?.remove();
+  if (!S.allTags.length) return;
+  const group = document.createElement('optgroup');
+  group.label = 'Tags';
+  group.innerHTML = S.allTags.map((t) => `<option value="tag:${esc(t)}">Tag: ${esc(t)}</option>`).join('');
+  sel.append(group);
+  if (S.filter.startsWith('tag:') && !S.allTags.includes(S.filter.slice(4))) { sel.value = 'all'; applyFilter(); } else sel.value = S.filter;
+}
+
+async function setTags(index, tags) {
+  const image = S.images.get(index);
+  const before = image.tags;
+  image.tags = tags;
+  renderTags();
+  updateThumb(index);
+  try {
+    const r = await api(`/api/frames/${index}/tags?${sq()}`, { method: 'PUT', body: { tags } });
+    image.tags = r.tags;
+    S.allTags = r.all;
+  } catch (err) {
+    image.tags = before;
+    if (err.status === 409) staleSession();
+    else toast(`Could not save the tags: ${err.message}`);
+  }
+  if (curIndex() === index) renderTags();
+  updateThumb(index);
+  renderTagFilter();
+  if (S.filter.startsWith('tag:')) applyFilter();
+}
+
+function wireTags() {
+  $('#tagForm').addEventListener('submit', (e) => {
+    e.preventDefault();
+    const input = $('#tagInput');
+    const tag = input.value.trim();
+    input.value = '';
+    if (!tag || !S.loaded) return;
+    const index = curIndex();
+    const tags = S.images.get(index).tags;
+    // Spelled like a tag already used, if it is one.
+    const known = S.allTags.find((t) => norm(t) === norm(tag)) || tag;
+    if (!tags.some((t) => norm(t) === norm(known))) setTags(index, [...tags, known]);
+  });
+  $('#tagInput').addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') { e.target.value = ''; e.target.blur(); }
+    e.stopPropagation();
+  });
+  $('#tagChips').addEventListener('click', (e) => {
+    const b = e.target.closest('[data-untag]');
+    if (!b) return;
+    const index = curIndex();
+    const tags = [...S.images.get(index).tags];
+    tags.splice(Number(b.dataset.untag), 1);
+    setTags(index, tags);
+  });
+}
+
 // The page of a project's batch: header, filters and labels.
 function setupProjectMode(p) {
-  for (const [id, w, h, name, status] of p.images) S.images.set(id, { w, h, name, status });
+  for (const [id, w, h, name, status, tags] of p.images) S.images.set(id, { w, h, name, status, tags: tags || [] });
+  S.allTags = p.tags || [];
+  $('#tagBox').hidden = false;
+  $('#keyTag').hidden = false;
   const title = p.project.name;
   document.title = `${title} · Annotate`;
   $('#fileName').textContent = title;
@@ -3145,6 +3224,7 @@ function setupProjectMode(p) {
   $('#filterSelect').innerHTML = '<option value="all">All images</option><option value="todo">Still to label</option>'
     + '<option value="unlabeled">Unlabeled</option><option value="predicted">Pre-labeled</option>'
     + '<option value="edited">Labeled</option><option value="empty">No boxes</option>';
+  renderTagFilter();
   $('#legendEdited').lastChild.textContent = 'labeled';
   $('#legendFailed').innerHTML = '<i class="sw sw-pred"></i>pre-labeled';
   $('#keyApprove').hidden = false;
@@ -3157,6 +3237,7 @@ function setupProjectMode(p) {
 
 async function init() {
   wireUi();
+  wireTags();
   wirePicker();
   wireTrain();
   wireAssist();
