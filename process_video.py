@@ -11,7 +11,7 @@ import math
 import os
 import sys
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import cv2
@@ -84,6 +84,296 @@ from showcase import (
 # the current directory). Variables already set in the shell win.
 load_dotenv(Path(__file__).resolve().parent / ".env")
 load_dotenv()
+
+
+# ---------------------------------------------------------
+# Detection
+# ---------------------------------------------------------
+
+
+@dataclass
+class DetectionRun:
+    """The result of the detection pre-pass.
+
+    `detections_by_frame` maps each sampled frame index to its detections
+    in video pixels (None when the detector call failed). `meta` goes into
+    the --save-detections info, `stats` is printed at the end.
+    """
+
+    detections_by_frame: dict[int, sv.Detections | None]
+    meta: dict = field(default_factory=dict)
+    stats: str = ""
+
+
+def detections_from_file(
+    loaded: DetectionsFile,
+    path: str,
+    detector: str,
+    coco: dict[int, str],
+    threshold: float,
+    video_info: sv.VideoInfo,
+) -> DetectionRun:
+    """The detections of a --load-detections file, matched to the classes
+    by name."""
+    name_to_id = {normalize_name(n): c for c, n in coco.items()}
+    detections_by_frame = {
+        index: (
+            None
+            if items is None
+            else to_detections(items, name_to_id, normalize_name, threshold)
+        )
+        for index, items in loaded.frames.items()
+    }
+    mismatch = [
+        f"{key} {loaded.video[key]} (video: {actual})"
+        for key, actual in (
+            ("width", video_info.width),
+            ("height", video_info.height),
+            ("total_frames", video_info.total_frames),
+        )
+        if loaded.video.get(key) not in (None, actual)
+    ]
+    if mismatch:
+        print(
+            "warning: detections file doesn't match this video: "
+            + ", ".join(mismatch)
+        )
+    print(
+        f"Loaded detections for {len(detections_by_frame)} frames "
+        f"from {path} (detector: {detector}), skipping detection"
+    )
+    return DetectionRun(detections_by_frame)
+
+
+def run_detector(
+    detector: str,
+    args,
+    *,
+    class_names: dict[int, str],
+    rfdetr_detector: RfDetrDetector | None,
+    source_path: Path,
+    video_info: sv.VideoInfo,
+    sample_step: float,
+    effective_rate: float,
+    expected_calls: int,
+) -> DetectionRun:
+    """Run `detector` on every sampled frame of the video.
+
+    Detection runs on a copy of the frame downscaled to
+    --infer-resolution; the boxes are scaled back so everything
+    downstream works in video pixels.
+    """
+    infer_w, infer_h = inference_size(
+        video_info.width, video_info.height, args.infer_resolution
+    )
+    resized = (infer_w, infer_h) != (video_info.width, video_info.height)
+    if resized:
+        print(
+            f"Inference resolution: {infer_w}x{infer_h} "
+            f"(video is {video_info.width}x{video_info.height})"
+        )
+    scale = np.array(
+        [video_info.width / infer_w, video_info.height / infer_h] * 2
+    )
+
+    def sampled_frames():
+        """(index, frame resized for inference) for every sampled frame."""
+        next_at = 0.0
+        for i, frame in enumerate(
+            sv.get_video_frames_generator(str(source_path))
+        ):
+            due, next_at = sampling_due(i, next_at, sample_step)
+            if due:
+                if resized:
+                    frame = cv2.resize(
+                        frame, (infer_w, infer_h), interpolation=cv2.INTER_AREA
+                    )
+                yield i, frame
+
+    sampling = (
+        f"{effective_rate:g} samples/s (one every {sample_step:g} frames, "
+        f"~{expected_calls} samples)"
+    )
+    unit = "frame" if detector == "rfdetr" else "call"
+
+    def progress() -> tqdm:
+        return tqdm(total=expected_calls, desc="Detecting", unit=unit)
+
+    if detector == "cloud":
+        raw, run = _detect_cloud(
+            args, class_names, sampled_frames(), sampling, progress
+        )
+    elif detector == "locate-anything":
+        raw, run = _detect_locate_anything(
+            args, class_names, sampled_frames(), sampling, progress
+        )
+    else:
+        raw, run = _detect_rfdetr(
+            args, rfdetr_detector, sampled_frames(), sampling, progress
+        )
+
+    for index, detections in raw.items():
+        if detections is not None and resized and len(detections) > 0:
+            detections.xyxy = (detections.xyxy * scale).astype(np.float32)
+        run.detections_by_frame[index] = detections
+    return run
+
+
+def _detect_cloud(args, class_names, frames, sampling, progress):
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        sys.exit(
+            "error: --detector cloud needs the ANTHROPIC_API_KEY "
+            "environment variable"
+        )
+    cloud_detector = CloudDetector(
+        model=args.cloud_model,
+        class_names=class_names,
+        threshold=args.threshold,
+        max_side=args.cloud_max_side,
+    )
+    print(
+        f"Cloud detector: {args.cloud_model}, {sampling}, "
+        f"{args.cloud_concurrency} calls in parallel"
+    )
+    # Detection doesn't depend on tracking, so every sampled frame is
+    # sent to the model up front (in parallel). Tracking, counting and
+    # drawing then replay the results in frame order.
+    print("Running cloud detection...")
+    with progress() as bar:
+        raw = cloud_detector.detect_frames(
+            frames,
+            args.cloud_concurrency,
+            on_done=lambda done, _submitted: bar.update(done - bar.n),
+        )
+    if cloud_detector.calls and cloud_detector.failures == cloud_detector.calls:
+        sys.exit(
+            "error: every cloud call failed (see the warnings above), "
+            "nothing to render"
+        )
+    return raw, DetectionRun(
+        {},
+        meta={"model": args.cloud_model},
+        stats=(
+            f"Cloud calls: {cloud_detector.calls} "
+            f"({cloud_detector.failures} failed), tokens: "
+            f"{cloud_detector.input_tokens} in / "
+            f"{cloud_detector.output_tokens} out"
+        ),
+    )
+
+
+def _detect_locate_anything(args, class_names, frames, sampling, progress):
+    if not args.locate_model:
+        sys.exit(
+            "error: --detector locate-anything needs --locate-model "
+            "(or the LOCATE_ANYTHING_MODEL environment variable)"
+        )
+    try:
+        locate_detector = LocateAnythingDetector(
+            model_path=args.locate_model,
+            class_names=class_names,
+            mode=args.locate_mode,
+            threads=args.locate_threads,
+            lib_path=args.locate_lib,
+        )
+    except RuntimeError as exc:
+        sys.exit(f"error: {exc}")
+    print(
+        f"locate-anything detector: {args.locate_model} "
+        f"({args.locate_mode}, {locate_detector.backend}), {sampling} x "
+        f"{len(locate_detector.prompts)} class(es), one call at a time"
+    )
+    for prompt in locate_detector.prompts.values():
+        print(f"Prompt: {prompt}")
+
+    print("Running locate-anything detection...")
+    with progress() as bar:
+        raw = locate_detector.detect_frames(
+            frames, on_done=lambda done: bar.update(done - bar.n)
+        )
+    if locate_detector.calls and (
+        locate_detector.failures == locate_detector.calls
+    ):
+        sys.exit(
+            "error: every locate-anything call failed (see the warnings "
+            "above), nothing to render"
+        )
+    return raw, DetectionRun(
+        {},
+        meta={"model": args.locate_model, "locate_mode": args.locate_mode},
+        stats=(
+            f"locate-anything calls: {locate_detector.calls} "
+            f"({locate_detector.failures} failed)"
+        ),
+    )
+
+
+def _detect_rfdetr(args, rfdetr_detector, frames, sampling, progress):
+    if rfdetr_detector is None:
+        rfdetr_detector = RfDetrDetector(args.model, args.threshold)
+    print(f"RF-DETR detector: {sampling}")
+    print("Running RF-DETR detection...")
+    with progress() as bar:
+        raw = rfdetr_detector.detect_frames(
+            frames, on_done=lambda done: bar.update(done - bar.n)
+        )
+    meta = {"model": rfdetr_detector.size}
+    if args.weights:
+        meta["weights"] = str(weights_path(args.weights))
+    return raw, DetectionRun({}, meta=meta)
+
+
+def write_detections(
+    path: Path,
+    args,
+    run: DetectionRun,
+    *,
+    detector: str,
+    sample_step: float,
+    coco: dict[int, str],
+    class_ids: list[int],
+    coco_classes: bool,
+    source_path: Path,
+    video_info: sv.VideoInfo,
+) -> None:
+    """Save --save-detections (raw, before tracking)."""
+    class_names = ", ".join(coco[c] for c in class_ids)
+    info = new_info(
+        {
+            "detector": detector,
+            "sample_step": sample_step,
+            "infer_resolution": args.infer_resolution,
+            "threshold": args.threshold,
+            **run.meta,
+        },
+        description=args.description
+        or f"{detector} detections of {class_names} in {source_path.name}",
+        contributor=args.contributor,
+        url=args.url,
+    )
+    video = {
+        "file_name": source_path.name,
+        "fps": video_info.fps,
+        "width": video_info.width,
+        "height": video_info.height,
+        "total_frames": video_info.total_frames,
+    }
+    save_detections(
+        path,
+        info,
+        video,
+        run.detections_by_frame,
+        label_of=lambda class_id: coco.get(class_id, str(class_id)),
+        # RF-DETR class ids are COCO's category ids; free-form classes and
+        # a fine-tuned model's are numbered from 0.
+        category_id_of=(
+            (lambda class_id: class_id)
+            if coco_classes
+            else (lambda class_id: class_id + 1)
+        ),
+        class_ids=class_ids,
+    )
+    print(f"Saved detections to: {path}")
 
 
 # ---------------------------------------------------------
@@ -640,268 +930,46 @@ def main() -> None:
     if args.min_track_frames is None:
         args.min_track_frames = 1 if sampled else 3
 
-    # -- Inference resolution (--infer-resolution) ------------------
-    # Detection runs on a downscaled copy of the frame; boxes are then
-    # scaled back so everything downstream works in video pixels.
-    infer_w, infer_h = inference_size(
-        video_info.width, video_info.height, args.infer_resolution
-    )
-    resized = (infer_w, infer_h) != (video_info.width, video_info.height)
-    if resized and loaded is None:
-        print(
-            f"Inference resolution: {infer_w}x{infer_h} "
-            f"(video is {video_info.width}x{video_info.height})"
-        )
-
-    def to_infer(frame: np.ndarray) -> np.ndarray:
-        if not resized:
-            return frame
-        return cv2.resize(
-            frame, (infer_w, infer_h), interpolation=cv2.INTER_AREA
-        )
-
-    def to_video(
-        detections: sv.Detections | None,
-    ) -> sv.Detections | None:
-        if detections is None or not resized or len(detections) == 0:
-            return detections
-        sx = video_info.width / infer_w
-        sy = video_info.height / infer_h
-        detections.xyxy = (
-            detections.xyxy * np.array([sx, sy, sx, sy])
-        ).astype(np.float32)
-        return detections
-
-    # -- Detector ---------------------------------------------------
-    # detections_by_frame: {frame index: Detections | None (failed)}.
-    # Filled up front, for every detector (or loaded file), before
-    # anything is tracked or drawn.
-    detections_by_frame: dict[int, sv.Detections | None] = {}
-    detector_stats = ""
-    detector_meta: dict = {}
-
-    def sampled_frames():
-        """(index, frame resized for inference) for every sampled frame."""
-        next_at = 0.0
-        for i, frame in enumerate(
-            sv.get_video_frames_generator(str(source_path))
-        ):
-            due, next_at = sampling_due(i, next_at, sample_step)
-            if due:
-                yield i, to_infer(frame)
-
+    # -- Detection --------------------------------------------------
+    # Every detector (or a loaded file) runs up front, before anything is
+    # tracked or drawn.
     if loaded is not None:
-        name_to_id = {normalize_name(n): c for c, n in coco.items()}
-        detections_by_frame = {
-            index: (
-                None
-                if items is None
-                else to_detections(
-                    items, name_to_id, normalize_name, args.threshold
-                )
-            )
-            for index, items in loaded.frames.items()
-        }
-        mismatch = [
-            f"{key} {loaded.video[key]} (video: {actual})"
-            for key, actual in (
-                ("width", video_info.width),
-                ("height", video_info.height),
-                ("total_frames", video_info.total_frames),
-            )
-            if loaded.video.get(key) not in (None, actual)
-        ]
-        if mismatch:
-            print(
-                "warning: detections file doesn't match this video: "
-                + ", ".join(mismatch)
-            )
-        print(
-            f"Loaded detections for {len(detections_by_frame)} frames "
-            f"from {args.load_detections} (detector: {detector}), "
-            "skipping detection"
+        run = detections_from_file(
+            loaded, args.load_detections, detector, coco, args.threshold,
+            video_info,
         )
-
-    elif detector == "cloud":
-        if not os.environ.get("ANTHROPIC_API_KEY"):
-            sys.exit(
-                "error: --detector cloud needs the ANTHROPIC_API_KEY "
-                "environment variable"
-            )
-        cloud_detector = CloudDetector(
-            model=args.cloud_model,
-            class_names={c: coco[c] for c in class_ids},
-            threshold=args.threshold,
-            max_side=args.cloud_max_side,
-        )
-        print(
-            f"Cloud detector: {args.cloud_model}, "
-            f"{effective_rate:g} samples/s (one call every "
-            f"{sample_step:g} frames, ~{expected_calls} calls, "
-            f"{args.cloud_concurrency} in parallel)"
-        )
-
-        # Detection doesn't depend on tracking, so every sampled
-        # frame is sent to the model up front (in parallel). Tracking,
-        # counting and drawing then replay the results in frame order
-        # while the output video is written.
-        print("Running cloud detection...")
-        with tqdm(
-            total=expected_calls, desc="Detecting", unit="call"
-        ) as bar:
-            detections_by_frame = {
-                index: to_video(det)
-                for index, det in cloud_detector.detect_frames(
-                    sampled_frames(),
-                    args.cloud_concurrency,
-                    on_done=lambda done, _submitted: bar.update(
-                        done - bar.n
-                    ),
-                ).items()
-            }
-        if cloud_detector.calls and (
-            cloud_detector.failures == cloud_detector.calls
-        ):
-            sys.exit(
-                "error: every cloud call failed (see the warnings "
-                "above), nothing to render"
-            )
-        detector_meta = {"model": args.cloud_model}
-        detector_stats = (
-            f"Cloud calls: {cloud_detector.calls} "
-            f"({cloud_detector.failures} failed), tokens: "
-            f"{cloud_detector.input_tokens} in / "
-            f"{cloud_detector.output_tokens} out"
-        )
-
-    elif detector == "locate-anything":
-        if not args.locate_model:
-            sys.exit(
-                "error: --detector locate-anything needs --locate-model "
-                "(or the LOCATE_ANYTHING_MODEL environment variable)"
-            )
-        try:
-            locate_detector = LocateAnythingDetector(
-                model_path=args.locate_model,
-                class_names={c: coco[c] for c in class_ids},
-                mode=args.locate_mode,
-                threads=args.locate_threads,
-                lib_path=args.locate_lib,
-            )
-        except RuntimeError as exc:
-            sys.exit(f"error: {exc}")
-        print(
-            f"locate-anything detector: {args.locate_model} "
-            f"({args.locate_mode}, {locate_detector.backend}), "
-            f"{effective_rate:g} samples/s (one "
-            f"sample every {sample_step:g} frames, ~{expected_calls} "
-            f"samples x {len(locate_detector.prompts)} class(es), one "
-            "call at a time)"
-        )
-        for prompt in locate_detector.prompts.values():
-            print(f"Prompt: {prompt}")
-
-        print("Running locate-anything detection...")
-        with tqdm(
-            total=expected_calls, desc="Detecting", unit="call"
-        ) as bar:
-            detections_by_frame = {
-                index: to_video(det)
-                for index, det in locate_detector.detect_frames(
-                    sampled_frames(),
-                    on_done=lambda done: bar.update(done - bar.n),
-                ).items()
-            }
-        if locate_detector.calls and (
-            locate_detector.failures == locate_detector.calls
-        ):
-            sys.exit(
-                "error: every locate-anything call failed (see the "
-                "warnings above), nothing to render"
-            )
-        detector_meta = {
-            "model": args.locate_model,
-            "locate_mode": args.locate_mode,
-        }
-        detector_stats = (
-            f"locate-anything calls: {locate_detector.calls} "
-            f"({locate_detector.failures} failed)"
-        )
-
     else:
-        if rfdetr_detector is None:
-            rfdetr_detector = RfDetrDetector(args.model, args.threshold)
-        print(
-            f"RF-DETR detector: {effective_rate:g} frames/s "
-            f"(one detection every {sample_step:g} frames, "
-            f"~{expected_calls} detections)"
+        run = run_detector(
+            detector,
+            args,
+            class_names={c: coco[c] for c in class_ids},
+            rfdetr_detector=rfdetr_detector,
+            source_path=source_path,
+            video_info=video_info,
+            sample_step=sample_step,
+            effective_rate=effective_rate,
+            expected_calls=expected_calls,
         )
-
-        print("Running RF-DETR detection...")
-        with tqdm(
-            total=expected_calls, desc="Detecting", unit="frame"
-        ) as bar:
-            detections_by_frame = {
-                index: to_video(det)
-                for index, det in rfdetr_detector.detect_frames(
-                    sampled_frames(),
-                    on_done=lambda done: bar.update(done - bar.n),
-                ).items()
-            }
-
-        detector_meta = {"model": rfdetr_detector.size}
-        if args.weights:
-            detector_meta["weights"] = str(weights_path(args.weights))
-
-    def write_detections() -> None:
-        """Save --save-detections (raw, before tracking)."""
-        if not args.save_detections:
-            return
-        save_path = Path(args.save_detections)
-        class_names = ", ".join(coco[c] for c in class_ids)
-        info = new_info(
-            {
-                "detector": detector,
-                "sample_step": sample_step,
-                "infer_resolution": args.infer_resolution,
-                "threshold": args.threshold,
-                **detector_meta,
-            },
-            description=args.description
-            or f"{detector} detections of {class_names} in {source_path.name}",
-            contributor=args.contributor,
-            url=args.url,
-        )
-        video = {
-            "file_name": source_path.name,
-            "fps": video_info.fps,
-            "width": video_info.width,
-            "height": video_info.height,
-            "total_frames": video_info.total_frames,
-        }
-        save_detections(
-            save_path,
-            info,
-            video,
-            detections_by_frame,
-            label_of=lambda class_id: coco.get(class_id, str(class_id)),
-            # RF-DETR class ids are COCO's category ids; free-form
-            # classes and a fine-tuned model's are numbered from 0.
-            category_id_of=(
-                (lambda class_id: class_id)
-                if coco_classes
-                else (lambda class_id: class_id + 1)
-            ),
-            class_ids=class_ids,
-        )
-        print(f"Saved detections to: {save_path}")
+    detections_by_frame = run.detections_by_frame
 
     # Detection is done already; save right away so the (slow / paid)
     # detections survive a failure while rendering.
-    write_detections()
+    if args.save_detections:
+        write_detections(
+            Path(args.save_detections),
+            args,
+            run,
+            detector=detector,
+            sample_step=sample_step,
+            coco=coco,
+            class_ids=class_ids,
+            coco_classes=coco_classes,
+            source_path=source_path,
+            video_info=video_info,
+        )
     if args.no_render:
-        if detector_stats:
-            print(detector_stats)
+        if run.stats:
+            print(run.stats)
         return
 
     # -- Tracker ----------------------------------------------------
@@ -1234,8 +1302,8 @@ def main() -> None:
         progress_message="Rendering video",
     )
 
-    if detector_stats:
-        print(detector_stats)
+    if run.stats:
+        print(run.stats)
     if showcase is not None and showcase.decisions_stats:
         print(showcase.decisions_stats)
 
