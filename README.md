@@ -1,6 +1,18 @@
 # How to run
 
-## Line crossing
+## Showcase mode
+```
+python process_video.py conveyor.mp4 \
+    --decisions decisions.example.yaml \
+    --line 940 0 940 1080 \
+    --classes apple \
+    --hud-title "CONVEYOR BELT MONITORING" \
+    --min-size 0 0 \
+    --mm-per-px 0.5 \
+    --size-grades S=95 M=105 L=115 XL
+```
+
+## Classic mode line crossing
 
 Horizontal in/out line
 ```
@@ -8,7 +20,8 @@ python process_video.py videos/highway/yHuR-GMbRNKnZLBvDBtHs_minimax-h3_topaz_up
   --line 0 700 1892 700 --in-text "EASTBOUND →" --out-text "← WESTBOUND" \
   --classes car truck \
   --hud-title "TRAFFIC MONITORING" \
-  --hud-rows "VEHICLES=all" "CARS=car" "TRUCKS=truck" --min-size 35 25
+  --hud-rows "VEHICLES=all" "CARS=car" "TRUCKS=truck" --min-size 35 25 \
+  --style classic
 ```
 
 Vertical line
@@ -20,16 +33,18 @@ python process_video.py videos/conveyor/upscaled/ttC_MBiNQpWETFACh7yoA_minimax-h
   --hud-title "CONVEYOR BELT MONITORING" \
   --hud-rows "APPLES=apple" \
   --min-size 0 0 \
-  --threshold 0.05
+  --threshold 0.05 \
+  --style classic
 ```
 
-## Total count instead of line crossing
+## Classic mode total count instead of line crossing
 
 python process_video.py videos/shipping_container/7RswKdWQhN167Z_MV8IgP_minimax-h3_upscale.mp4 \
   --count-mode total \
   --classes car truck \
   --hud-title "TRAFFIC MONITORING" \
-  --hud-rows "VEHICLES=all" "CARS=car" "TRUCKS=truck" --min-size 35 25
+  --hud-rows "VEHICLES=all" "CARS=car" "TRUCKS=truck" --min-size 35 25 \
+  --style classic
 
 
 Counts every distinct tracked object seen in the video. No line is drawn.
@@ -290,11 +305,16 @@ panel with:
 
 `--style classic` gives the original boxes, labels and corner counter.
 
-    python process_video.py videos/conveyor/upscaled/ttC_MBiNQpWETFACh7yoA_minimax-h3_upscaled.mp4 \
+    python process_video.py conveyor.mp4 \
+      --decisions decisions.example.yaml \
+      --line 940 0 940 1080 \
+      --classes apple \
+      --hud-title "CONVEYOR BELT MONITORING" \
+      --min-size 0 0 \
+      --mm-per-px 0.5 \
+      --size-grades S=95 M=105 L=115 XL \
       --load-detections dets.json \
-      --line 940 0 940 1080 --classes apple --hud-title "Apples counted" \
-      --mm-per-px 0.5 --size-grades S=95 M=105 L=115 XL \
-      --decisions decisions.example.yaml
+      --load-decisions decisions.json \
 
 Each object's **best view** is the box, among those fully inside the picture,
 that is closest to its usual width and height. That skips boxes the detector
