@@ -220,3 +220,48 @@ def build_hud_rows(
             label = coco[ids[0]].upper()
         rows.append((label.strip(), ids))
     return rows
+
+
+def parse_size_grades(tokens: list[str]) -> list[tuple[str, float | None]]:
+    """--size-grades `S=65 M=72 L=80 XL` -> [(name, upper bound mm), ...].
+
+    Each NAME=MAX grade holds sizes below MAX (and at or above the
+    previous grade's MAX); the last grade has no MAX and holds the rest.
+    """
+    grades: list[tuple[str, float | None]] = []
+    tokens = split_tokens(tokens)
+    for i, token in enumerate(tokens):
+        last = i == len(tokens) - 1
+        name, sep, upper = token.partition("=")
+        name = name.strip()
+        if not name:
+            raise ValueError(f"--size-grades '{token}': missing grade name")
+        if not sep:
+            if not last:
+                raise ValueError(
+                    f"--size-grades '{token}': only the last grade can "
+                    "omit its upper bound (NAME=MAX_MM)"
+                )
+            grades.append((name, None))
+            continue
+        if last:
+            raise ValueError(
+                f"--size-grades '{token}': the last grade takes no upper "
+                f"bound, it holds everything above the previous one "
+                f"(e.g. ... {name})"
+            )
+        try:
+            bound = float(upper)
+        except ValueError:
+            raise ValueError(
+                f"--size-grades '{token}': '{upper}' is not a number (mm)"
+            ) from None
+        if grades and bound <= grades[-1][1]:
+            raise ValueError(
+                "--size-grades: upper bounds must increase "
+                f"('{token}' after {grades[-1][0]}={grades[-1][1]:g})"
+            )
+        grades.append((name, bound))
+    if len(grades) < 2:
+        raise ValueError("--size-grades needs at least two grades, e.g. S=65 L")
+    return grades

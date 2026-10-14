@@ -270,6 +270,81 @@ virtual, nothing is written to disk for them.
   rendering.
 - The file opens in standard COCO tools (e.g. `pycocotools`).
 
+## Showcase overlay: measurements, throughput, classification
+
+`--style showcase` (the default) draws corner brackets with an ID chip on
+every object, a dashed count line that pulses on each count, and one side
+panel with:
+
+- the total count and how many were counted in the last `--throughput-window`
+  seconds (default 10);
+- a row of stats: throughput per hour, over that same window and
+  recalculated every `--throughput-update` seconds (default 2), and the
+  average size (with `--mm-per-px`);
+- with `--decisions`, a donut of the classes from the YAML (e.g. ripe /
+  unripe / defect) with the share of "good" ones in the middle;
+- with `--size-grades`, a bar per size grade.
+
+`--style classic` gives the original boxes, labels and corner counter.
+
+    python process_video.py videos/conveyor/upscaled/ttC_MBiNQpWETFACh7yoA_minimax-h3_upscaled.mp4 \
+      --load-detections dets.json \
+      --line 940 0 940 1080 --classes apple --hud-title "Apples counted" \
+      --mm-per-px 0.5 --size-grades S=95 M=105 L=115 XL \
+      --decisions decisions.example.yaml
+
+**Size.** For now the size is the **diagonal of the box**. Each object gets one
+size: the median over the frames where its box is fully inside the picture
+(boxes cut off at the edge are skipped). `--mm-per-px` turns pixels into mm.
+Measure something of known size in the video: a 600 mm crate that is 540 px
+wide gives `--mm-per-px 1.11`. The grades are in mm. Each `NAME=MAX` grade
+holds sizes below MAX, and the last grade takes no MAX, so
+`S=95 M=105 L=115 XL` means S < 95 ≤ M < 105 ≤ L < 115 ≤ XL. The grades apply
+to the diagonal, so a box diagonal is about 1.41 × the fruit's diameter.
+
+**Classification (OpenAI Decisions API).** This is optional and lives in
+`decisions.py`. With `--decisions config.yaml`, every tracked object is
+cropped once, from its largest fully visible box. The crop is sent to
+`client.decisions.create` with one choice question, and the brackets and chips
+are colored by the answer. Everything video-specific goes in the YAML, so the
+same code works for other produce or defects:
+
+- the context text and the question;
+- the choices, with a description and a color for each;
+- which choices count as `good` (the panel's headline %);
+- which choices are `flag`ged (always written on the chip);
+- `min_confidence`, below which an object is shown as "unverified";
+- crop padding and size, and concurrency.
+
+See `decisions.example.yaml`. It needs `OPENAI_API_KEY` in the environment or
+in `.env`. The calls run after tracking and before rendering.
+
+Every answer is saved next to the output video as `<output>_decisions.json`
+(or wherever `--save-decisions FILE` says). Each saved answer has the track
+id, the frame and box the crop came from, the choice, confidence,
+probabilities and status (`ok`, `low_confidence`, `refused`, `failed`). The
+file also stores the config the answers were made with. To re-render without
+calling the API again, pass it back:
+
+    python process_video.py ... --decisions decisions.example.yaml \
+      --load-decisions ttC_showcase_decisions.json
+
+Answers are matched by crop (same frame, box overlap ≥ 90%), so changing
+the look, the line or the size options still reuses them. Only objects
+without a matching answer (and failed calls) go to the API, and the key is
+only needed then. If the model, question, choices or crop settings in the
+YAML changed, the file is ignored. `min_confidence` is applied again on
+load, so you can change it without new calls.
+
+Other options:
+
+- `--hud-position left|right` puts the panel on that side.
+- `--hud-font Regular.ttf,Medium.ttf,Bold.ttf` sets the font. The default is
+  Manrope if it is installed, else Helvetica Neue on macOS, else DejaVu Sans.
+- `--no-labels` hides the chips.
+- `--no-hud` hides the panel.
+- `--trace-length N` turns traces back on.
+
 ## Projects: upload, label, train (AI Studio)
 
     python annotate_server.py            # http://127.0.0.1:8000

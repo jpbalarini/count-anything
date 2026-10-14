@@ -11,6 +11,7 @@ import math
 import os
 import sys
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
@@ -29,6 +30,14 @@ from cli import (
     parse_args,
 )
 from cloud_detector import CloudDetector
+from decisions import (
+    DecisionsClassifier,
+    DecisionsConfig,
+    SavedDecisions,
+    Verdict,
+    crop_box,
+    save_decisions,
+)
 from detections_io import (
     DetectionsFile,
     load_detections,
@@ -53,6 +62,7 @@ from options import (
     load_coco_classes,
     normalize_name,
     parse_color,
+    parse_size_grades,
     resolve_class,
     split_tokens,
 )
@@ -61,11 +71,317 @@ from rfdetr_detector import (
     recommended_threshold,
     weights_path,
 )
+from showcase import (
+    GOOD_HEX,
+    ChoiceStyle,
+    PanelStats,
+    ShowcaseRenderer,
+    TrackInfo,
+    hex_to_rgb,
+)
 
-# Load ANTHROPIC_API_KEY etc. from .env next to this script (and from
+# Load ANTHROPIC_API_KEY / OPENAI_API_KEY etc. from .env next to this script (and from
 # the current directory). Variables already set in the shell win.
 load_dotenv(Path(__file__).resolve().parent / ".env")
 load_dotenv()
+
+
+# ---------------------------------------------------------
+# Showcase style: measurement, classification, renderer
+# ---------------------------------------------------------
+
+# Boxes this close (px) to the border of the picture are cut off.
+EDGE_MARGIN = 2
+
+
+@dataclass
+class Showcase:
+    """Everything the showcase style needs to draw a frame."""
+
+    renderer: ShowcaseRenderer
+    panel_stats: PanelStats
+    tracks: dict[int, TrackInfo]
+    decisions_stats: str = ""
+
+    def draw(
+        self, frame: np.ndarray, index: int, detections: sv.Detections
+    ) -> np.ndarray:
+        objects = (
+            list(
+                zip(
+                    detections.xyxy,
+                    detections.class_id.tolist(),
+                    detections.tracker_id.tolist(),
+                )
+            )
+            if detections.tracker_id is not None
+            else []
+        )
+        return self.renderer.draw(
+            frame,
+            index,
+            objects,
+            self.tracks,
+            self.panel_stats.at(index),
+            self.panel_stats.last_count_frame(index),
+        )
+
+
+def measure_tracks(
+    track_ids: set[int],
+    observations: dict[int, list[tuple[int, np.ndarray]]],
+    width: int,
+    height: int,
+    mm_per_px: float | None,
+) -> tuple[dict[int, TrackInfo], dict[int, tuple[int, np.ndarray]]]:
+    """Size and best view of every track.
+
+    The size is the box diagonal: the median over the frames the box is
+    fully inside the picture (else its largest). The best view, used to
+    classify the object, is its largest box among those fully inside the
+    picture (else its largest). Returns ({id: TrackInfo}, {id: (frame,
+    box)}).
+    """
+
+    def inside(xyxy: np.ndarray) -> bool:
+        x1, y1, x2, y2 = xyxy
+        return (
+            x1 > EDGE_MARGIN and y1 > EDGE_MARGIN
+            and x2 < width - EDGE_MARGIN and y2 < height - EDGE_MARGIN
+        )
+
+    def diagonal(xyxy: np.ndarray) -> float:
+        return float(np.hypot(xyxy[2] - xyxy[0], xyxy[3] - xyxy[1]))
+
+    tracks: dict[int, TrackInfo] = {}
+    best_view: dict[int, tuple[int, np.ndarray]] = {}
+    for tracker_id in track_ids:
+        obs = observations.get(tracker_id)
+        if not obs:
+            continue
+        full = [o for o in obs if inside(o[1])]
+        size_mm = None
+        if mm_per_px:
+            diagonals = [diagonal(b) for _, b in (full or obs)]
+            size_px = float(np.median(diagonals)) if full else max(diagonals)
+            size_mm = size_px * mm_per_px
+        tracks[tracker_id] = TrackInfo(size_mm=size_mm)
+        best_view[tracker_id] = max(
+            full or obs,
+            key=lambda o: (o[1][2] - o[1][0]) * (o[1][3] - o[1][1]),
+        )
+    return tracks, best_view
+
+
+def classify_tracks(
+    best_view: dict[int, tuple[int, np.ndarray]],
+    config: DecisionsConfig,
+    source_path: Path,
+    save_path: Path,
+    saved: SavedDecisions | None,
+    saved_path: str | None,
+) -> tuple[dict[int, Verdict], str]:
+    """Classify each track's best view with the Decisions API.
+
+    Answers in `saved` (--load-decisions) are reused for matching crops;
+    the rest are cropped from the video and sent to the API. All answers
+    are written to `save_path`. Returns ({id: Verdict}, API stats line).
+    """
+    verdicts: dict[int, Verdict] = {}
+    reused: set[int] = set()
+    if saved is not None:
+        if not saved.compatible:
+            print(
+                f"warning: {saved_path} was made with a different model / "
+                "question / crop settings, its answers are not reused"
+            )
+        else:
+            for tracker_id, (frame_index, box) in best_view.items():
+                verdict = saved.lookup(frame_index, box)
+                if verdict is not None:
+                    verdicts[tracker_id] = verdict
+                    reused.add(tracker_id)
+            print(
+                f"Reusing {len(reused)} of {len(best_view)} answers "
+                f"from {saved_path}"
+            )
+    todo = {t: v for t, v in best_view.items() if t not in reused}
+
+    stats = ""
+    if todo:
+        try:
+            classifier = DecisionsClassifier(config)
+        except RuntimeError as exc:
+            sys.exit(f"error: {exc}")
+
+        # One pass over the video collects every crop.
+        wanted: dict[int, list[int]] = defaultdict(list)
+        for tracker_id, (frame_index, _) in todo.items():
+            wanted[frame_index].append(tracker_id)
+        crops: dict[int, np.ndarray] = {}
+        last_wanted = max(wanted)
+        for i, frame in enumerate(
+            tqdm(
+                sv.get_video_frames_generator(str(source_path)),
+                total=last_wanted + 1,
+                desc="Cropping",
+                unit="frame",
+            )
+        ):
+            for tracker_id in wanted.get(i, ()):
+                crop = crop_box(frame, todo[tracker_id][1], config.crop_padding)
+                if crop is not None:
+                    crops[tracker_id] = crop
+            if i >= last_wanted:
+                break
+
+        print(
+            f"Decisions API: {config.model}, classifying {len(crops)} "
+            f"objects ({config.concurrency} in parallel) with {config.path}"
+        )
+        with tqdm(total=len(crops), desc="Classifying", unit="obj") as bar:
+            verdicts |= classifier.classify(
+                crops, on_done=lambda done: bar.update(done - bar.n)
+            )
+        if classifier.calls and classifier.failures == classifier.calls:
+            print(
+                "warning: every decisions call failed (see above), "
+                "objects are shown as unverified"
+            )
+        stats = classifier.stats()
+
+    save_decisions(
+        save_path,
+        config,
+        source_path.name,
+        [
+            {
+                "track_id": tracker_id,
+                "frame": best_view[tracker_id][0],
+                "box": best_view[tracker_id][1],
+                "verdict": verdict,
+                "reused": tracker_id in reused,
+            }
+            for tracker_id, verdict in verdicts.items()
+        ],
+    )
+    print(f"Saved decisions to: {save_path}")
+    return verdicts, stats
+
+
+def prepare_showcase(
+    args,
+    *,
+    video_info: sv.VideoInfo,
+    source_path: Path,
+    target_path: Path,
+    samples: list[tuple],
+    counted: list[tuple[int, int, int]],
+    observations: dict[int, list[tuple[int, np.ndarray]]],
+    class_ids: list[int],
+    color_map: dict[int, str],
+    hud_rows: list[tuple[str, list[int]]],
+    size_grades: list[tuple[str, float | None]] | None,
+    line_zone: sv.LineZone | None,
+    decisions_config: DecisionsConfig | None,
+    saved_decisions: SavedDecisions | None,
+) -> Showcase:
+    """Measure (and optionally classify) the tracks after the tracking
+    pass, and set up the showcase renderer and panel."""
+    # Every track that is drawn or counted.
+    track_ids = {
+        int(t)
+        for _, shown, *_ in samples
+        if shown.tracker_id is not None
+        for t in shown.tracker_id
+    } | {t for _, t, _ in counted}
+    tracks, best_view = measure_tracks(
+        track_ids,
+        observations,
+        video_info.width,
+        video_info.height,
+        args.mm_per_px,
+    )
+
+    decisions_stats = ""
+    if decisions_config is not None and best_view:
+        verdicts, decisions_stats = classify_tracks(
+            best_view,
+            decisions_config,
+            source_path,
+            save_path=(
+                Path(args.save_decisions)
+                if args.save_decisions
+                else target_path.with_name(f"{target_path.stem}_decisions.json")
+            ),
+            saved=saved_decisions,
+            saved_path=args.load_decisions,
+        )
+        for tracker_id, verdict in verdicts.items():
+            tracks[tracker_id].verdict = verdict.value
+
+    choices = (
+        [
+            ChoiceStyle(c.value, hex_to_rgb(c.color), c.good, c.flag)
+            for c in decisions_config.choices
+        ]
+        if decisions_config
+        else None
+    )
+    # The big number is the total, so rows that count every class would
+    # only repeat it.
+    panel_rows = [
+        (label, ids) for label, ids in hud_rows if set(ids) != set(class_ids)
+    ]
+    panel_stats = PanelStats(
+        counted,
+        tracks,
+        fps=video_info.fps,
+        window_s=args.throughput_window,
+        update_s=args.throughput_update,
+        rows=panel_rows,
+        choices=choices,
+        grades=size_grades,
+        measure=bool(args.mm_per_px),
+    )
+
+    line_points = None
+    if line_zone is not None:
+        line_points = (
+            line_zone.vector.start.x, line_zone.vector.start.y,
+            line_zone.vector.end.x, line_zone.vector.end.y,
+        )
+    try:
+        renderer = ShowcaseRenderer(
+            video_info.width,
+            video_info.height,
+            video_info.fps,
+            title=args.hud_title,
+            accent_hex=(args.hud_color or args.line_color),
+            # A single class without --colors gets the showcase teal.
+            class_colors=(
+                color_map
+                if args.colors or len(class_ids) > 1
+                else {class_ids[0]: GOOD_HEX}
+            ),
+            choices=choices,
+            quality_title=decisions_config.title if decisions_config else "",
+            position=args.hud_position,
+            font_arg=args.hud_font,
+            show_panel=not args.no_hud,
+            show_tags=not args.no_labels,
+            line=line_points,
+            line_label=(
+                None
+                if args.in_text is None or is_hidden_label(args.in_text)
+                else args.in_text
+            ),
+            window_s=args.throughput_window,
+        )
+    except ValueError as exc:
+        sys.exit(f"error: {exc}")
+
+    return Showcase(renderer, panel_stats, tracks, decisions_stats)
 
 
 # ---------------------------------------------------------
@@ -207,7 +523,30 @@ def main() -> None:
         hud_rows = build_hud_rows(args.hud_rows, class_ids, coco)
         line_color = parse_color(args.line_color)
         hud_color = parse_color(args.hud_color or args.line_color)
-    except ValueError as exc:
+        size_grades = (
+            parse_size_grades(args.size_grades) if args.size_grades else None
+        )
+        # Loaded (and the API key checked) before detection, so a bad
+        # config doesn't surface after a slow / paid detection pass.
+        decisions_config = (
+            DecisionsConfig.load(args.decisions) if args.decisions else None
+        )
+        saved_decisions = (
+            SavedDecisions(Path(args.load_decisions), decisions_config)
+            if args.load_decisions
+            else None
+        )
+        if (
+            decisions_config
+            and not args.no_render
+            and not os.environ.get("OPENAI_API_KEY")
+            and saved_decisions is None
+        ):
+            raise ValueError(
+                "--decisions needs the OPENAI_API_KEY environment variable "
+                "(or put it in .env)"
+            )
+    except (ValueError, RuntimeError) as exc:
         sys.exit(f"error: {exc}")
 
     source_path = Path(args.source)
@@ -631,7 +970,7 @@ def main() -> None:
 
     hud = (
         None
-        if args.no_hud
+        if args.no_hud or args.style != "classic"
         else Hud(
             args.hud_title,
             hud_rows,
@@ -705,8 +1044,13 @@ def main() -> None:
     # `crossing` mode, distinct tracked objects in `total` mode.
     counts: dict[int, int] = defaultdict(int)
     seen_track_ids: set[int] = set()  # total mode only
+    # One (frame index, track id, class id) per count, in frame order.
+    counted: list[tuple[int, int, int]] = []
+    # {track id: [(frame index, xyxy), ...]} of every tracked box, for
+    # measuring and classifying (showcase style).
+    observations: dict[int, list[tuple[int, np.ndarray]]] = defaultdict(list)
 
-    def process(detections: sv.Detections) -> sv.Detections:
+    def process(detections: sv.Detections, index: int) -> sv.Detections:
         """Track, filter and count one set of detections.
 
         Returns the detections to draw. Called once per sampled frame
@@ -722,6 +1066,10 @@ def main() -> None:
         # Remove detections without confirmed track IDs
         if detections.tracker_id is not None:
             detections = detections[detections.tracker_id >= 0]
+            for xyxy, tracker_id in zip(
+                detections.xyxy, detections.tracker_id
+            ):
+                observations[int(tracker_id)].append((index, xyxy.copy()))
 
         # Size filter (see --min-size / --max-size). By default this
         # only affects what is drawn; with --size-filter all the
@@ -745,6 +1093,9 @@ def main() -> None:
                     if int(tracker_id) not in seen_track_ids:
                         seen_track_ids.add(int(tracker_id))
                         counts[int(class_id)] += 1
+                        counted.append(
+                            (index, int(tracker_id), int(class_id))
+                        )
         else:
             crossed_in, crossed_out = line_zone.trigger(detections)
 
@@ -756,40 +1107,39 @@ def main() -> None:
                 crossed = crossed_in | crossed_out
 
             if np.any(crossed):
-                for class_id in detections.class_id[crossed]:
+                for class_id, tracker_id in zip(
+                    detections.class_id[crossed],
+                    detections.tracker_id[crossed],
+                ):
                     counts[int(class_id)] += 1
+                    counted.append((index, int(tracker_id), int(class_id)))
 
         return with_held(display_detections)
 
-    # Detections currently on screen. With sampled detection these are
-    # held (unchanged) until the next sample arrives, unless
-    # --interpolate is on.
-    display_detections = sv.Detections.empty()
-    next_sample_at = 0.0
-
-    # -- Interpolation (--interpolate) ------------------------------
-    # Drawing a frame between two samples needs the tracked boxes of
-    # the samples after it, so tracking, size filter and counting run
-    # over every sample up front. Each sample keeps a snapshot of the
-    # counts (HUD and line) as they were right after it, which is what is
-    # shown until the next sample.
+    # -- Tracking pass ----------------------------------------------
+    # Tracking, size filter and counting run over every sample up front:
+    # interpolating a frame between two samples needs the tracked boxes
+    # of the sample after it, and measuring / classifying an object
+    # needs all of its boxes. Each sample keeps a snapshot of the counts
+    # (HUD and line) as they were right after it, which is what is shown
+    # until the next sample. Without --interpolate a sample's boxes are
+    # held (unchanged) until the next one.
     # samples: (frame index, boxes to draw, HUD counts, line in, line out)
     samples: list[tuple[int, sv.Detections, dict, int, int]] = []
-    if interpolate:
-        for sample_index in sorted(detections_by_frame):
-            detections = detections_by_frame[sample_index]
-            if detections is None:  # detection call failed
-                continue
-            shown = process(detections)
-            samples.append(
-                (
-                    sample_index,
-                    shown,
-                    dict(counts),
-                    line_zone.in_count if line_zone else 0,
-                    line_zone.out_count if line_zone else 0,
-                )
+    for sample_index in sorted(detections_by_frame):
+        detections = detections_by_frame[sample_index]
+        if detections is None:  # detection call failed
+            continue
+        shown = process(detections, sample_index)
+        samples.append(
+            (
+                sample_index,
+                shown,
+                dict(counts),
+                line_zone.in_count if line_zone else 0,
+                line_zone.out_count if line_zone else 0,
             )
+        )
     sample_indices = [s[0] for s in samples]
     timeline = TrackTimeline(
         sample_indices, [s[1] for s in samples], hold_frames
@@ -801,8 +1151,8 @@ def main() -> None:
         if pos < 0:  # before the first successful sample
             empty_line = CountedLine(line_zone, 0, 0) if line_zone else None
             return timeline.at(index), {}, empty_line
-        _, _, hud_counts, line_in, line_out = samples[pos]
-        boxes = timeline.at(index)
+        _, held_boxes, hud_counts, line_in, line_out = samples[pos]
+        boxes = timeline.at(index) if interpolate else held_boxes
         line = (
             CountedLine(line_zone, line_in, line_out)
             if line_zone
@@ -810,23 +1160,36 @@ def main() -> None:
         )
         return boxes, hud_counts, line
 
+    # -- Measurement / classification (showcase style) ---------------
+    showcase = None
+    if args.style == "showcase":
+        showcase = prepare_showcase(
+            args,
+            video_info=video_info,
+            source_path=source_path,
+            target_path=target_path,
+            samples=samples,
+            counted=counted,
+            observations=observations,
+            class_ids=class_ids,
+            color_map=color_map,
+            hud_rows=hud_rows,
+            size_grades=size_grades,
+            line_zone=line_zone,
+            decisions_config=decisions_config,
+            saved_decisions=saved_decisions,
+        )
+
     # -- Frame callback ---------------------------------------------
     def callback(frame: np.ndarray, index: int) -> np.ndarray:
-        nonlocal display_detections, next_sample_at
+        display_detections, shown_counts, shown_line = state_at(index)
 
-        shown_counts, shown_line = counts, line_zone
-        if interpolate:
-            display_detections, shown_counts, shown_line = state_at(index)
-        else:
-            # Is this a frame we have detections for? Every
-            # `sample_step` frames (every frame when sample_step is 1).
-            due, next_sample_at = sampling_due(
-                index, next_sample_at, sample_step
-            )
-            if due:
-                detections = detections_by_frame.get(index)
-                if detections is not None:  # None = detection call failed
-                    display_detections = process(detections)
+        if showcase is not None:
+            if trace_annotator is not None:
+                frame = trace_annotator.annotate(
+                    scene=frame.copy(), detections=display_detections
+                )
+            return showcase.draw(frame, index, display_detections)
 
         labels = [
             f"{coco[int(class_id)].upper()} · {int(tracker_id):02d}"
@@ -873,6 +1236,8 @@ def main() -> None:
 
     if detector_stats:
         print(detector_stats)
+    if showcase is not None and showcase.decisions_stats:
+        print(showcase.decisions_stats)
 
     print(f"Saved to: {target_path}")
 

@@ -124,6 +124,13 @@ then run it on every frame (see train_rfdetr.py --help):
     python train_rfdetr.py dets.json -o models/apples
     python process_video.py input.mp4 --weights models/apples
 
+Showcase overlay with measurements, size grades and a ripeness check by
+the OpenAI Decisions API (see decisions.example.yaml):
+
+    python process_video.py input.mp4 --classes apple --line 940 0 940 1080 \
+        --hud-title "Apples counted" --mm-per-px 1.1 \
+        --size-grades S=65 M=72 L=80 XL --decisions decisions.example.yaml
+
 Run `python process_video.py --list-classes` to see the available class ids
 (rfdetr detector only; with --weights, the model's classes).
 """
@@ -574,8 +581,106 @@ def parse_args() -> argparse.Namespace:
     hud.add_argument(
         "--trace-length",
         type=int,
-        default=20,
-        help="Trace length in frames, 0 disables traces (default: 20).",
+        default=None,
+        help=(
+            "Trace length in frames, 0 disables traces (default: 20 "
+            "with --style classic, 0 with --style showcase)."
+        ),
+    )
+
+    show = p.add_argument_group("showcase style (measurements, throughput, decisions)")
+    show.add_argument(
+        "--style",
+        choices=["showcase", "classic"],
+        default="showcase",
+        help=(
+            "`showcase`: corner brackets with ID chips, a dashed count "
+            "line and a glass side panel with the total, throughput, "
+            "classification split, size grades and average size. "
+            "`classic`: the original boxes, labels and corner counter "
+            "(default: showcase)."
+        ),
+    )
+    show.add_argument(
+        "--hud-position",
+        choices=["right", "left"],
+        default="right",
+        help="Side of the frame the showcase panel goes on (default: right).",
+    )
+    show.add_argument(
+        "--hud-font",
+        metavar="REGULAR[,MEDIUM[,BOLD]]",
+        help=(
+            "TTF/OTF font file(s) for the showcase text, e.g. "
+            "`Inter-Regular.ttf,Inter-Medium.ttf,Inter-Bold.ttf` "
+            "(default: Manrope if installed, else Helvetica Neue on "
+            "macOS, else DejaVu Sans)."
+        ),
+    )
+    show.add_argument(
+        "--mm-per-px",
+        type=float,
+        metavar="MM",
+        help=(
+            "Millimetres per video pixel, to measure objects. Each "
+            "object's size is the diagonal of its box (median over the "
+            "frames it is fully inside the picture). Work it out from "
+            "something of known size: a 600 mm crate that is 540 px "
+            "wide gives 600/540 = 1.11."
+        ),
+    )
+    show.add_argument(
+        "--size-grades",
+        nargs="+",
+        metavar="NAME=MAX_MM",
+        help=(
+            "Size grade brackets in mm (needs --mm-per-px), e.g. "
+            "`S=65 M=72 L=80 XL`: S < 65 mm <= M < 72 <= L < 80 <= XL. "
+            "The last grade takes no bound."
+        ),
+    )
+    show.add_argument(
+        "--throughput-window",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help=(
+            "Throughput (per hour) and the '+N in last ...' chip are "
+            "measured over the last SECONDS of video (default: 10)."
+        ),
+    )
+    show.add_argument(
+        "--decisions",
+        metavar="CONFIG.yaml",
+        help=(
+            "Classify every tracked object (e.g. ripe / unripe / defect) "
+            "with the OpenAI Decisions API, as described in a YAML file "
+            "(see decisions.example.yaml). Needs OPENAI_API_KEY."
+        ),
+    )
+    show.add_argument(
+        "--save-decisions",
+        metavar="FILE.json",
+        help=(
+            "Where to save the Decisions API answers (default: next to the "
+            "output video, <output name>_decisions.json)."
+        ),
+    )
+    show.add_argument(
+        "--load-decisions",
+        metavar="FILE.json",
+        help=(
+            "Reuse the answers saved by an earlier run (matched by the "
+            "frame and box of each crop); only objects without a saved "
+            "answer are sent to the API."
+        ),
+    )
+    show.add_argument(
+        "--throughput-update",
+        type=float,
+        default=2.0,
+        metavar="SECONDS",
+        help="How often the throughput number is recalculated (default: 2).",
     )
 
     args = p.parse_args()
@@ -600,6 +705,26 @@ def parse_args() -> argparse.Namespace:
         p.error(
             "--save-detections and --load-detections can't be combined"
         )
+    if args.style == "classic":
+        for flag, value in (
+            ("--decisions", args.decisions),
+            ("--mm-per-px", args.mm_per_px),
+            ("--size-grades", args.size_grades),
+        ):
+            if value:
+                p.error(f"{flag} is shown by --style showcase only")
+    if (args.save_decisions or args.load_decisions) and not args.decisions:
+        p.error("--save-decisions / --load-decisions need --decisions")
+    if args.throughput_update <= 0:
+        p.error("--throughput-update must be > 0")
+    if args.size_grades and not args.mm_per_px:
+        p.error("--size-grades needs --mm-per-px (grades are in mm)")
+    if args.mm_per_px is not None and args.mm_per_px <= 0:
+        p.error("--mm-per-px must be > 0")
+    if args.throughput_window <= 0:
+        p.error("--throughput-window must be > 0")
+    if args.trace_length is None:
+        args.trace_length = 20 if args.style == "classic" else 0
     if args.no_render and not args.save_detections:
         p.error("--no-render needs --save-detections")
     if args.weights and args.load_detections:

@@ -1,0 +1,44 @@
+# Classify every tracked object with the OpenAI Decisions API.
+# Use with: python process_video.py ... --decisions decisions.example.yaml
+# Needs OPENAI_API_KEY (in the environment or in .env).
+
+model: gpt-6-luna
+
+# Sent as text together with each object's crop. Describe what the
+# crop shows so the model knows what it is looking at.
+context: >
+  A single apple, cropped from an overhead camera above a packhouse
+  conveyor. The footage has some motion blur. Neighbouring apples or the
+  crate may show at the edges; judge only the apple in the centre.
+
+question:
+  name: ripeness
+  title: Ripeness          # HUD section title
+  instructions: Is the apple in the centre ripe and fit to be packed?
+  choices:
+    - value: ripe
+      description: >
+        Red, yellow or red-blushed skin (bicolor red and green apples with
+        a red or pink blush count as ripe), no visible damage.
+      color: "#5DCAA5"
+      good: true           # counts towards the HUD headline percentage
+    - value: unripe
+      description: Almost entirely green skin with little or no blush, undamaged.
+      color: "#C7D36F"
+    - value: defect
+      description: >
+        Clearly visible damage: brown bruises, cuts, punctures, rot or mold.
+        Blur, shadows, reflections, color streaks, the stem cavity and the
+        calyx are not defects.
+      color: "#F0997B"
+      flag: true           # always written on the object's chip
+
+# Answers below this confidence are shown as "unverified". The API's
+# confidence is stricter than the top probability: a 50/50 answer comes
+# back around 0.25, a 70% one around 0.5.
+min_confidence: 0.3
+
+crop_padding: 0.15         # margin around the box, as a fraction of its size
+crop_max_side: 384         # crops are downscaled to at most this many px
+image_detail: low          # low | high | auto | original
+concurrency: 16            # requests in flight at once
