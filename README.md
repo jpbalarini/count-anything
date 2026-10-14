@@ -348,7 +348,9 @@ See `decisions.example.yaml`. It needs `OPENAI_API_KEY` in the environment or
 in `.env`. The calls run after tracking and before rendering.
 
 Every answer is saved next to the output video as `<output>_decisions.json`
-(or wherever `--save-decisions FILE` says). Each saved answer has the track
+(or wherever `--save-decisions FILE` says). The exception is a run where every
+answer came from `--load-decisions`: that file already has them, so nothing is
+saved unless `--save-decisions` asks for a copy. Each saved answer has the track
 id, the frame and box the crop came from, the choice, confidence,
 probabilities and status (`ok`, `low_confidence`, `refused`, `failed`). The
 file also stores the config the answers were made with. To re-render without

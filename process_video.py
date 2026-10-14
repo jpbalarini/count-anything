@@ -501,20 +501,17 @@ def collect_crops(
         wanted[frame_index].append(tracker_id)
     out: dict[int, object] = {}
     last_wanted = max(wanted)
-    for i, frame in enumerate(
-        tqdm(
-            sv.get_video_frames_generator(str(source_path)),
-            total=last_wanted + 1,
-            desc="Cropping",
-            unit="frame",
-        )
-    ):
-        for tracker_id in wanted.get(i, ()):
-            crop = crop_box(frame, views[tracker_id][1], padding)
-            if crop is not None:
-                out[tracker_id] = transform(tracker_id, crop)
-        if i >= last_wanted:
-            break
+    with tqdm(total=last_wanted + 1, desc="Cropping", unit="frame") as bar:
+        for i, frame in enumerate(
+            sv.get_video_frames_generator(str(source_path))
+        ):
+            for tracker_id in wanted.get(i, ()):
+                crop = crop_box(frame, views[tracker_id][1], padding)
+                if crop is not None:
+                    out[tracker_id] = transform(tracker_id, crop)
+            bar.update(1)
+            if i >= last_wanted:
+                break
     return out
 
 
@@ -717,7 +714,15 @@ def prepare_showcase(
     for tracker_id, verdict in verdicts.items():
         tracks[tracker_id].verdict = verdict.value
 
-    if decisions_on:
+    # Saved when there is something new (or --save-decisions asks for a
+    # copy): when every answer came from --load-decisions, that file
+    # already has them.
+    if decisions_on and not todo and not args.save_decisions:
+        print(
+            f"All {len(verdicts)} answers reused from {args.load_decisions}, "
+            "nothing new to save"
+        )
+    elif decisions_on:
         save_path = (
             Path(args.save_decisions)
             if args.save_decisions

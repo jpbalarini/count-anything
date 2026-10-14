@@ -663,7 +663,9 @@ def parse_args() -> argparse.Namespace:
         metavar="FILE.json",
         help=(
             "Where to save the Decisions API answers (default: next to the "
-            "output video, <output name>_decisions.json)."
+            "output video, <output name>_decisions.json). Without it, "
+            "nothing is saved when every answer came from "
+            "--load-decisions."
         ),
     )
     show.add_argument(
