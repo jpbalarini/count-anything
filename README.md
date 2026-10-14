@@ -278,6 +278,9 @@ panel with:
 
 - the total count and how many were counted in the last `--throughput-window`
   seconds (default 10);
+- next to it, the last item counted: a thumbnail of its best view, with its id,
+  class from `--decisions` and size. It changes at most every half second, so
+  it can be read on a busy line;
 - a row of stats: throughput per hour, over that same window and
   recalculated every `--throughput-update` seconds (default 2), and the
   average size (with `--mm-per-px`);
@@ -292,6 +295,11 @@ panel with:
       --line 940 0 940 1080 --classes apple --hud-title "Apples counted" \
       --mm-per-px 0.5 --size-grades S=95 M=105 L=115 XL \
       --decisions decisions.example.yaml
+
+Each object's **best view** is the box, among those fully inside the picture,
+that is closest to its usual width and height. That skips boxes the detector
+merged with a neighbour or cut short. The best view is what goes to the
+Decisions API and what the thumbnail shows.
 
 **Size.** For now the size is the **diagonal of the box**. Each object gets one
 size: the median over the frames where its box is fully inside the picture

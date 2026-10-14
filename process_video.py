@@ -382,6 +382,9 @@ def write_detections(
 
 # Boxes this close (px) to the border of the picture are cut off.
 EDGE_MARGIN = 2
+# Margin around the "last item" thumbnails without --decisions (with it,
+# the YAML's crop_padding is used so one crop serves both).
+THUMB_PADDING = 0.15
 
 
 @dataclass
@@ -391,6 +394,7 @@ class Showcase:
     renderer: ShowcaseRenderer
     panel_stats: PanelStats
     tracks: dict[int, TrackInfo]
+    thumbnails: dict[int, np.ndarray]  # "last item" images by track id
     decisions_stats: str = ""
 
     def draw(
@@ -414,6 +418,7 @@ class Showcase:
             self.tracks,
             self.panel_stats.at(index),
             self.panel_stats.last_count_frame(index),
+            self.thumbnails,
         )
 
 
@@ -428,8 +433,10 @@ def measure_tracks(
 
     The size is the box diagonal: the median over the frames the box is
     fully inside the picture (else its largest). The best view, used to
-    classify the object, is its largest box among those fully inside the
-    picture (else its largest). Returns ({id: TrackInfo}, {id: (frame,
+    classify the object and as its thumbnail, is the box (fully inside
+    the picture when there is one) closest to the track's median width
+    and height: a typical box, not one the detector merged with a
+    neighbour or cut short. Returns ({id: TrackInfo}, {id: (frame,
     box)}).
     """
 
@@ -456,107 +463,121 @@ def measure_tracks(
             size_px = float(np.median(diagonals)) if full else max(diagonals)
             size_mm = size_px * mm_per_px
         tracks[tracker_id] = TrackInfo(size_mm=size_mm)
-        best_view[tracker_id] = max(
-            full or obs,
-            key=lambda o: (o[1][2] - o[1][0]) * (o[1][3] - o[1][1]),
+
+        candidates = full or obs
+        boxes = np.array([b for _, b in candidates])
+        widths = boxes[:, 2] - boxes[:, 0]
+        heights = boxes[:, 3] - boxes[:, 1]
+        med_w, med_h = np.median(widths), np.median(heights)
+        off = (
+            np.abs(widths - med_w) / max(med_w, 1)
+            + np.abs(heights - med_h) / max(med_h, 1)
         )
+        # Closest to typical; among equally typical ones, the largest.
+        best = min(
+            range(len(candidates)),
+            key=lambda i: (round(float(off[i]), 3), -widths[i] * heights[i]),
+        )
+        best_view[tracker_id] = candidates[best]
     return tracks, best_view
 
 
-def classify_tracks(
-    best_view: dict[int, tuple[int, np.ndarray]],
-    config: DecisionsConfig,
+def collect_crops(
     source_path: Path,
-    save_path: Path,
+    views: dict[int, tuple[int, np.ndarray]],
+    padding: float,
+    transform,
+) -> dict[int, object]:
+    """One pass over the video cropping each track's view.
+
+    `views` is {track id: (frame index, box)}; each crop (box plus
+    `padding` x its size) is passed through `transform(track id, crop)`
+    and the results returned by track id.
+    """
+    if not views:
+        return {}
+    wanted: dict[int, list[int]] = defaultdict(list)
+    for tracker_id, (frame_index, _) in views.items():
+        wanted[frame_index].append(tracker_id)
+    out: dict[int, object] = {}
+    last_wanted = max(wanted)
+    for i, frame in enumerate(
+        tqdm(
+            sv.get_video_frames_generator(str(source_path)),
+            total=last_wanted + 1,
+            desc="Cropping",
+            unit="frame",
+        )
+    ):
+        for tracker_id in wanted.get(i, ()):
+            crop = crop_box(frame, views[tracker_id][1], padding)
+            if crop is not None:
+                out[tracker_id] = transform(tracker_id, crop)
+        if i >= last_wanted:
+            break
+    return out
+
+
+def downscale(image: np.ndarray, max_side: int) -> np.ndarray:
+    h, w = image.shape[:2]
+    scale = max_side / max(h, w)
+    if scale >= 1:
+        return image
+    return cv2.resize(
+        image,
+        (max(1, round(w * scale)), max(1, round(h * scale))),
+        interpolation=cv2.INTER_AREA,
+    )
+
+
+def reuse_decisions(
+    best_view: dict[int, tuple[int, np.ndarray]],
     saved: SavedDecisions | None,
     saved_path: str | None,
-) -> tuple[dict[int, Verdict], str]:
-    """Classify each track's best view with the Decisions API.
-
-    Answers in `saved` (--load-decisions) are reused for matching crops;
-    the rest are cropped from the video and sent to the API. All answers
-    are written to `save_path`. Returns ({id: Verdict}, API stats line).
-    """
-    verdicts: dict[int, Verdict] = {}
-    reused: set[int] = set()
-    if saved is not None:
-        if not saved.compatible:
-            print(
-                f"warning: {saved_path} was made with a different model / "
-                "question / crop settings, its answers are not reused"
-            )
-        else:
-            for tracker_id, (frame_index, box) in best_view.items():
-                verdict = saved.lookup(frame_index, box)
-                if verdict is not None:
-                    verdicts[tracker_id] = verdict
-                    reused.add(tracker_id)
-            print(
-                f"Reusing {len(reused)} of {len(best_view)} answers "
-                f"from {saved_path}"
-            )
-    todo = {t: v for t, v in best_view.items() if t not in reused}
-
-    stats = ""
-    if todo:
-        try:
-            classifier = DecisionsClassifier(config)
-        except RuntimeError as exc:
-            sys.exit(f"error: {exc}")
-
-        # One pass over the video collects every crop.
-        wanted: dict[int, list[int]] = defaultdict(list)
-        for tracker_id, (frame_index, _) in todo.items():
-            wanted[frame_index].append(tracker_id)
-        crops: dict[int, np.ndarray] = {}
-        last_wanted = max(wanted)
-        for i, frame in enumerate(
-            tqdm(
-                sv.get_video_frames_generator(str(source_path)),
-                total=last_wanted + 1,
-                desc="Cropping",
-                unit="frame",
-            )
-        ):
-            for tracker_id in wanted.get(i, ()):
-                crop = crop_box(frame, todo[tracker_id][1], config.crop_padding)
-                if crop is not None:
-                    crops[tracker_id] = crop
-            if i >= last_wanted:
-                break
-
+) -> dict[int, Verdict]:
+    """The --load-decisions answers that match a track's crop."""
+    if saved is None:
+        return {}
+    if not saved.compatible:
         print(
-            f"Decisions API: {config.model}, classifying {len(crops)} "
-            f"objects ({config.concurrency} in parallel) with {config.path}"
+            f"warning: {saved_path} was made with a different model / "
+            "question / crop settings, its answers are not reused"
         )
-        with tqdm(total=len(crops), desc="Classifying", unit="obj") as bar:
-            verdicts |= classifier.classify(
-                crops, on_done=lambda done: bar.update(done - bar.n)
-            )
-        if classifier.calls and classifier.failures == classifier.calls:
-            print(
-                "warning: every decisions call failed (see above), "
-                "objects are shown as unverified"
-            )
-        stats = classifier.stats()
-
-    save_decisions(
-        save_path,
-        config,
-        source_path.name,
-        [
-            {
-                "track_id": tracker_id,
-                "frame": best_view[tracker_id][0],
-                "box": best_view[tracker_id][1],
-                "verdict": verdict,
-                "reused": tracker_id in reused,
-            }
-            for tracker_id, verdict in verdicts.items()
-        ],
+        return {}
+    verdicts = {}
+    for tracker_id, (frame_index, box) in best_view.items():
+        verdict = saved.lookup(frame_index, box)
+        if verdict is not None:
+            verdicts[tracker_id] = verdict
+    print(
+        f"Reusing {len(verdicts)} of {len(best_view)} answers from {saved_path}"
     )
-    print(f"Saved decisions to: {save_path}")
-    return verdicts, stats
+    return verdicts
+
+
+def classify_crops(
+    crops: dict[int, np.ndarray], config: DecisionsConfig
+) -> tuple[dict[int, Verdict], str]:
+    """Send the crops to the Decisions API. Returns ({id: Verdict}, API
+    stats line)."""
+    try:
+        classifier = DecisionsClassifier(config)
+    except RuntimeError as exc:
+        sys.exit(f"error: {exc}")
+    print(
+        f"Decisions API: {config.model}, classifying {len(crops)} "
+        f"objects ({config.concurrency} in parallel) with {config.path}"
+    )
+    with tqdm(total=len(crops), desc="Classifying", unit="obj") as bar:
+        verdicts = classifier.classify(
+            crops, on_done=lambda done: bar.update(done - bar.n)
+        )
+    if classifier.calls and classifier.failures == classifier.calls:
+        print(
+            "warning: every decisions call failed (see above), "
+            "objects are shown as unverified"
+        )
+    return verdicts, classifier.stats()
 
 
 def prepare_showcase(
@@ -592,23 +613,6 @@ def prepare_showcase(
         video_info.height,
         args.mm_per_px,
     )
-
-    decisions_stats = ""
-    if decisions_config is not None and best_view:
-        verdicts, decisions_stats = classify_tracks(
-            best_view,
-            decisions_config,
-            source_path,
-            save_path=(
-                Path(args.save_decisions)
-                if args.save_decisions
-                else target_path.with_name(f"{target_path.stem}_decisions.json")
-            ),
-            saved=saved_decisions,
-            saved_path=args.load_decisions,
-        )
-        for tracker_id, verdict in verdicts.items():
-            tracks[tracker_id].verdict = verdict.value
 
     choices = (
         [
@@ -671,7 +675,72 @@ def prepare_showcase(
     except ValueError as exc:
         sys.exit(f"error: {exc}")
 
-    return Showcase(renderer, panel_stats, tracks, decisions_stats)
+    # Decisions: reuse saved answers, the rest go to the API.
+    decisions_on = decisions_config is not None and bool(best_view)
+    verdicts: dict[int, Verdict] = {}
+    if decisions_on:
+        verdicts = reuse_decisions(
+            best_view, saved_decisions, args.load_decisions
+        )
+    reused = set(verdicts)
+    todo = set(best_view) - reused if decisions_on else set()
+
+    # One pass over the video crops what the API needs and the "last
+    # item" thumbnails of the counted objects.
+    thumb_ids = (
+        {t for _, t, _ in counted} & best_view.keys() if not args.no_hud else set()
+    )
+
+    def transform(tracker_id: int, crop: np.ndarray):
+        return (
+            downscale(crop, decisions_config.crop_max_side)
+            if tracker_id in todo
+            else None,
+            renderer.thumbnail(crop) if tracker_id in thumb_ids else None,
+        )
+
+    crops = collect_crops(
+        source_path,
+        {t: best_view[t] for t in todo | thumb_ids},
+        decisions_config.crop_padding if decisions_config else THUMB_PADDING,
+        transform,
+    )
+    thumbnails = {t: c[1] for t, c in crops.items() if c[1] is not None}
+
+    decisions_stats = ""
+    if todo:
+        new, decisions_stats = classify_crops(
+            {t: c[0] for t, c in crops.items() if c[0] is not None},
+            decisions_config,
+        )
+        verdicts |= new
+    for tracker_id, verdict in verdicts.items():
+        tracks[tracker_id].verdict = verdict.value
+
+    if decisions_on:
+        save_path = (
+            Path(args.save_decisions)
+            if args.save_decisions
+            else target_path.with_name(f"{target_path.stem}_decisions.json")
+        )
+        save_decisions(
+            save_path,
+            decisions_config,
+            source_path.name,
+            [
+                {
+                    "track_id": tracker_id,
+                    "frame": best_view[tracker_id][0],
+                    "box": best_view[tracker_id][1],
+                    "verdict": verdict,
+                    "reused": tracker_id in reused,
+                }
+                for tracker_id, verdict in verdicts.items()
+            ],
+        )
+        print(f"Saved decisions to: {save_path}")
+
+    return Showcase(renderer, panel_stats, tracks, thumbnails, decisions_stats)
 
 
 # ---------------------------------------------------------

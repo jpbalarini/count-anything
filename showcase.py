@@ -55,6 +55,8 @@ FONT_CANDIDATES = [
 ]
 
 PULSE_SECONDS = 0.35  # count line highlight after a count
+LAST_ITEM_SECONDS = 0.5  # the "last item" thumbnail changes at most this often
+THUMB_SIZE = 150  # px at 1080p
 
 
 def hex_to_rgb(value: str) -> tuple[int, int, int]:
@@ -90,13 +92,10 @@ class Fonts:
         regular, medium, bold = self._resolve(font_arg)
 
         def load(spec, size):
-            path, index, weight = spec
-            font = ImageFont.truetype(
-                path, max(8, round(size * scale)), index=index
-            )
-            if weight:
-                font.set_variation_by_name(weight)
-            return font
+            return self._load(spec, max(8, round(size * scale)))
+
+        self._bold = bold
+        self._sized: dict[int, ImageFont.FreeTypeFont] = {}
 
         self.caps = load(medium, 17)  # small uppercase labels
         self.big = load(bold, 136)
@@ -108,6 +107,24 @@ class Fonts:
         self.donut = load(bold, 36)
         self.unit = load(medium, 20)
         self.tag = load(medium, 16)
+
+    @staticmethod
+    def _load(spec, size: int) -> ImageFont.FreeTypeFont:
+        path, index, weight = spec
+        font = ImageFont.truetype(path, size, index=index)
+        if weight:
+            font.set_variation_by_name(weight)
+        return font
+
+    def big_fitting(self, text: str, max_width: float) -> ImageFont.FreeTypeFont:
+        """The big-number font, shrunk until `text` fits in `max_width`."""
+        font, size = self.big, self.big.size
+        while font.getlength(text) > max_width and size > 40:
+            size -= 6
+            if size not in self._sized:
+                self._sized[size] = self._load(self._bold, size)
+            font = self._sized[size]
+        return font
 
     @staticmethod
     def _resolve(font_arg: str | None):
@@ -160,6 +177,9 @@ class PanelState:
     unverified: int = 0
     grade_counts: list[tuple[str, int]] = field(default_factory=list)
     avg_mm: float | None = None
+    measure: bool = False  # sizes are measured (avg_mm may still be None)
+    last_track: int | None = None  # the "last item" shown next to the count
+    last_class: int | None = None
 
 
 class PanelStats:
@@ -188,6 +208,7 @@ class PanelStats:
         self.fps = fps
         self.window_s = window_s
         self.update_step = max(1, round(update_s * fps))  # frames
+        self.last_item_step = max(1, round(LAST_ITEM_SECONDS * fps))
         self.rows = rows
         self.choices = choices
         self.grades = grades
@@ -234,6 +255,14 @@ class PanelStats:
         tick = index - index % self.update_step
         window = min(self.window_s, tick / self.fps)
         rate = self._recent(tick) / window * 3600 if window >= 2.0 else None
+
+        # The last counted object, as of the last LAST_ITEM_SECONDS tick,
+        # so the thumbnail doesn't flicker on a busy line.
+        tick = index - index % self.last_item_step
+        n_tick = bisect.bisect_right(self.frames, tick)
+        _, last_track, last_class = (
+            self.counted[n_tick - 1] if n_tick else (None, None, None)
+        )
         return PanelState(
             total=n,
             recent=recent,
@@ -243,6 +272,9 @@ class PanelStats:
             unverified=unverified,
             grade_counts=grade_counts,
             avg_mm=avg_mm,
+            measure=self.measure,
+            last_track=last_track,
+            last_class=last_class,
         )
 
     def _recent(self, index: int) -> int:
@@ -303,6 +335,7 @@ class ShowcaseRenderer:
         self.line = line
         self.line_label = line_label
         self.window_s = window_s
+        self._masks: dict[tuple, np.ndarray] = {}
         # Panel columns (its height depends on what it shows).
         pw, margin = self.px(560), self.px(32)
         x0 = margin if position == "left" else width - margin - pw
@@ -336,6 +369,35 @@ class ShowcaseRenderer:
                                 ((x2 - r, y2 - r), 0), ((x1 + r, y2 - r), 90)):
             cv2.ellipse(img, (cx, cy), (r, r), 0, start, start + 90, color,
                         thickness, cv2.LINE_AA)
+
+    def _paste_rounded(self, img, x, y, image, radius):
+        h, w = image.shape[:2]
+        x, y = int(round(x)), int(round(y))
+        if x < 0 or y < 0 or x + w > self.w or y + h > self.h:
+            return
+        key = (w, h, radius)
+        mask = self._masks.get(key)
+        if mask is None:
+            mask = np.zeros((h, w), np.uint8)
+            self._rounded_rect(mask, 0, 0, w - 1, h - 1, radius, 255)
+            mask = (mask.astype(np.float32) / 255)[:, :, None]
+            self._masks[key] = mask
+        region = img[y : y + h, x : x + w]
+        region[:] = (image * mask + region * (1 - mask)).astype(np.uint8)
+
+    @property
+    def thumb_size(self) -> int:
+        return self.px(THUMB_SIZE)
+
+    def thumbnail(self, crop: np.ndarray) -> np.ndarray:
+        """A crop as the square "last item" thumbnail (center cut)."""
+        h, w = crop.shape[:2]
+        side = min(h, w)
+        y0, x0 = (h - side) // 2, (w - side) // 2
+        square = crop[y0 : y0 + side, x0 : x0 + side]
+        size = self.thumb_size
+        interpolation = cv2.INTER_AREA if side > size else cv2.INTER_CUBIC
+        return cv2.resize(square, (size, size), interpolation=interpolation)
 
     def _brackets(self, img, x1, y1, x2, y2, color, thickness):
         bw, bh = x2 - x1, y2 - y1
@@ -374,9 +436,14 @@ class ShowcaseRenderer:
         tracks: dict[int, TrackInfo],
         panel: PanelState | None,
         last_count_frame: int | None,
+        thumbnails: dict[int, np.ndarray] | None = None,
     ) -> np.ndarray:
-        """`objects` are (xyxy, class id, track id) of the boxes to draw."""
+        """`objects` are (xyxy, class id, track id) of the boxes to draw;
+        `thumbnails` ({track id: square BGR image, see `thumbnail`}) feed
+        the "last item" next to the count."""
         out = frame.copy()
+        self._tracks = tracks
+        self._thumbnails = thumbnails or {}
 
         # Objects and the count line first, then the panel over them.
         self._begin(out)
@@ -420,6 +487,8 @@ class ShowcaseRenderer:
                 self._rounded_rect(out, *args)
             elif kind == "outline":
                 self._rounded_outline(out, *args)
+            elif kind == "image":
+                self._paste_rounded(out, *args)
             elif kind == "arc":
                 center, r, start, end, color, thickness = args
                 cv2.ellipse(out, center, (r, r), 0, start, end, color,
@@ -555,14 +624,21 @@ class ShowcaseRenderer:
         def caps(x, y, text, color=MUTED, anchor="ls"):
             self._text(x, y, text.upper(), f.caps, color, anchor=anchor, spacing=px(1.8))
 
-        # Title + big number + recent chip
+        # Left: title, big number, recent chip. Right: the last item.
+        thumb = self.thumb_size
+        col_x = right - thumb
+        top = y
         caps(left, y + px(16), self.title)
         y += px(16) + px(140)
-        self._text(left - px(4), y, fmt_int(st.total), f.big, WHITE)
+        total = fmt_int(st.total)
+        big = f.big_fitting(total, col_x - left - px(24))
+        self._text(left - px(4), y, total, big, WHITE)
         y += px(24)
         chip = f"+{fmt_int(st.recent)} in last {self.window_s:g} s"
         _, ch = self._chip(left, y, chip, GOOD, bg=GOOD_DARK, solid=True)
-        y += ch
+        y = max(
+            y + ch, self._draw_last_item(col_x, top, st.last_track, st.last_class)
+        )
 
         # Stat tiles: throughput and average size, each with an icon
         tiles = [(
@@ -572,9 +648,12 @@ class ShowcaseRenderer:
             "per hour",
             self._icon_bars,
         )]
-        if st.avg_mm is not None:
+        if st.measure:
             tiles.append(
-                ("Avg size", f"{st.avg_mm:.0f}", "mm", "box diagonal",
+                ("Avg size",
+                 "—" if st.avg_mm is None else f"{st.avg_mm:.0f}",
+                 "" if st.avg_mm is None else "mm",
+                 "box diagonal",
                  self._icon_diameter)
             )
         separator()
@@ -686,6 +765,41 @@ class ShowcaseRenderer:
         y += pad
         self._panel_background(x0, y0, x0 + pw, y, px(22))
         return x0, y0, x0 + pw, y
+
+    def _draw_last_item(
+        self, x, top, track_id: int | None, class_id: int | None
+    ) -> float:
+        """The "last item" column of the panel header, `THUMB_SIZE` wide,
+        starting at (x, top). Returns where it ends."""
+        f, px = self.fonts, self.px
+        size, radius = self.thumb_size, px(14)
+        self._text(x, top + px(16), "LAST ITEM", f.caps, MUTED, spacing=px(1.8))
+        y = top + px(34)
+
+        image = self._thumbnails.get(track_id) if track_id is not None else None
+        info = self._tracks.get(track_id) if track_id is not None else None
+        if image is None:
+            self._solid.append(
+                ("outline", (x, y, x + size, y + size, radius, bgr(SEPARATOR), px(2)))
+            )
+            self._text(x + size / 2, y + size / 2, "—", f.donut, MUTED, anchor="mm")
+            return y + size
+
+        color, choice = self._object_color(info, class_id)
+        self._solid.append(("image", (x, y, image, radius)))
+        self._solid.append(
+            ("outline", (x, y, x + size - 1, y + size - 1, radius, bgr(color), px(2.5)))
+        )
+        y += size + px(30)
+        self._text(x, y, f"#{track_id}", f.value, WHITE)
+        if choice is not None:
+            self._text(x + size, y, choice.value, f.label, color, anchor="rs")
+        elif self.choices is not None:
+            self._text(x + size, y, "unverified", f.small, MUTED, anchor="rs")
+        if info is not None and info.size_mm:
+            y += px(26)
+            self._text(x, y, f"{info.size_mm:.0f} mm", f.small, MUTED)
+        return y
 
     def _panel_background(self, x0, y0, x1, y1, radius):
         """Rounded card: vertical gradient (translucent) and a thin border."""
